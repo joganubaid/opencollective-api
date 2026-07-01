@@ -1,0 +1,883 @@
+/* eslint-disable camelcase */
+import { execSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import querystring from 'querystring';
+import { Readable } from 'stream';
+
+import { expect } from 'chai';
+import config from 'config';
+import debug from 'debug';
+import { Request } from 'express';
+import { graphql } from 'graphql';
+import Upload from 'graphql-upload/Upload.js';
+import { cloneDeep, get, groupBy, isArray, omit, values } from 'lodash';
+import markdownTable from 'markdown-table';
+import nock from 'nock';
+import { generateSync } from 'otplib';
+import sinon, { assert } from 'sinon';
+
+import * as dbRestore from '../scripts/db_restore';
+import PlatformConstants from '../server/constants/platform';
+import { generateLoaders, Loaders } from '../server/graphql/loaders';
+import schemaV1 from '../server/graphql/v1/schema';
+import schemaV2 from '../server/graphql/v2/schema';
+import cache, { sessionCache } from '../server/lib/cache';
+import { crypto } from '../server/lib/encryption';
+import logger from '../server/lib/logger';
+/* Server code being used */
+import stripe, { convertToStripeAmount } from '../server/lib/stripe';
+import { formatCurrency } from '../server/lib/utils';
+import models, { sequelize, UserToken } from '../server/models';
+
+/* Test data */
+import jsonData from './mocks/data';
+import { fakeActiveHost, randStr } from './test-helpers/fake-data';
+
+jsonData.application = {
+  name: 'client',
+  api_key: config.keys.opencollective.apiKey,
+};
+
+export const data = path => {
+  const copy = cloneDeep(get(jsonData, path)); // to avoid changing these data
+  return isArray(get(jsonData, path)) ? values(copy) : copy;
+};
+
+export const resetCaches = async () => {
+  await cache.clear();
+  await sessionCache.clear();
+};
+
+export const resetTestDB = async ({ groupedTruncate = true, retries = 5 } = {}) => {
+  const resetFn = async () => {
+    // Using a manual query rather than `await sequelize.truncate({ cascade: true,  restartIdentity: true });`
+    // for performance reasons: https://github.com/sequelize/sequelize/issues/15865
+    const tableNames = values(sequelize.models).map(m => `"${m.tableName}"`);
+    if (groupedTruncate) {
+      await sequelize.query(`TRUNCATE TABLE ${tableNames.join(', ')} RESTART IDENTITY CASCADE`);
+    } else {
+      // It was noted that using this syntax could avoid deadlocks
+      for (const tableName of tableNames) {
+        await sequelize.query(`TRUNCATE TABLE ${tableName} RESTART IDENTITY CASCADE`);
+      }
+    }
+    // TODO: Do we really want to refresh all materialized views? That sounds expensive
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "TransactionBalances"`);
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "CollectiveBalanceCheckpoint"`);
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "CollectiveOrderStats"`);
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "CollectiveTagStats"`);
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "ExpenseTagStats"`);
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "CollectiveTransactionStats"`);
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "HostedCollectivesDailyFinancialActivity"`);
+  };
+
+  let t = 1;
+  while (t <= retries) {
+    try {
+      await resetFn();
+      break;
+    } catch (e) {
+      if (t === retries) {
+        console.error(e);
+        process.exit(1);
+      }
+      console.error(
+        `Error while resetting the DB for connection ${JSON.stringify(config.database)}. Error: ${JSON.stringify(e)}\nRetrying...`,
+      );
+      await sleep(1000 * t);
+      t++;
+    }
+  }
+};
+
+export const seedDefaultVendors = async () => {
+  return sequelize.query(`
+    INSERT INTO "Collectives" ("type", "slug", "name", "website", "createdAt", "updatedAt")
+    VALUES
+      ('VENDOR', 'stripe-payment-processor-vendor', 'Stripe', 'https://stripe.com', NOW(), NOW()),
+      ('VENDOR', 'paypal-payment-processor-vendor', 'PayPal', 'https://paypal.com', NOW(), NOW()),
+      ('VENDOR', 'wise-payment-processor-vendor', 'Wise', 'https://wise.com', NOW(), NOW()),
+      ('VENDOR', 'other-payment-processor-vendor', 'Other Payment Processor', NULL, NOW(), NOW()),
+      ('VENDOR', 'eu-vat-tax-vendor', 'European VAT', NULL, NOW(), NOW()),
+      ('VENDOR', 'nz-gst-tax-vendor', 'New Zealand GST', NULL, NOW(), NOW()),
+      ('VENDOR', 'other-tax-vendor', 'Other Tax', NULL, NOW(), NOW())
+    ON CONFLICT DO NOTHING;
+  `);
+};
+
+export async function loadDB(dbname) {
+  await dbRestore.main({ force: true, file: dbname });
+}
+
+export const stringify = json => {
+  return JSON.stringify(json, null, '>>>>')
+    .replace(/\n>>>>+"([^"]+)"/g, '$1')
+    .replace(/\n|>>>>+/g, '');
+};
+
+export const makeRequest = (
+  remoteUser = undefined,
+  query = undefined,
+  jwtPayload = undefined,
+  headers = {},
+  userToken = undefined,
+  personalToken = undefined,
+) => {
+  // Build `req` first so `generateLoaders(req)` can close over the same object; loaders such as
+  // `canSeePrivateAccount` call `req.loaders.Collective.byId` when they run.
+  const req = {
+    method: 'GET',
+    baseUrl: '/',
+    ip: '127.0.0.1',
+    params: {},
+    remoteUser,
+    jwtPayload,
+    body: { query },
+    headers,
+    header: () => null,
+    get: a => {
+      return headers[a];
+    },
+    userToken,
+    personalToken,
+    res: {
+      cookie: () => {},
+    },
+    loaders: undefined as unknown as Loaders,
+  };
+  req.loaders = generateLoaders(req);
+  return req as unknown as Request;
+};
+
+export const makeGenericRequest = ({
+  remoteUser = null,
+  personalToken = null,
+  userToken = null,
+  jwtPayload = null,
+  headers = {},
+  body = {},
+  method = 'GET',
+  baseUrl = '/',
+  ip = '127.0.0.1',
+  params = {},
+}: {
+  remoteUser?: object | null;
+  personalToken?: object | null;
+  userToken?: object | null;
+  jwtPayload?: object | null;
+  headers?: Record<string, string>;
+  body?: Record<string, unknown>;
+  method?: string;
+  baseUrl?: string;
+  ip?: string;
+  params?: Record<string, string>;
+} = {}): Request => {
+  return {
+    method,
+    baseUrl,
+    ip,
+    params,
+    remoteUser,
+    jwtPayload,
+    body,
+    loaders: generateLoaders({ remoteUser }),
+    headers,
+    header: () => null,
+    get: (a: string) => headers[a],
+    userToken,
+    personalToken,
+    res: {
+      cookie: () => {},
+    },
+  } as unknown as Request;
+};
+
+export const inspectSpy = (spy, argsCount) => {
+  for (let i = 0; i < spy.callCount; i++) {
+    console.log(`>>> spy.args[${i}]`, { ...spy.args[i].slice(0, argsCount) });
+  }
+};
+
+export const sleep = async (timeout = 200) =>
+  new Promise(resolve => {
+    setTimeout(resolve, timeout);
+  });
+
+/**
+ * Sleep until the process is resumed.
+ * @returns {{ promise: Promise<void>; resume: () => void }}
+ */
+export const getResumableSleep = () => {
+  let resume;
+  const promise = new Promise(resolve => (resume = resolve));
+  return { promise, resume };
+};
+
+/**
+ * Wait for condition to be met
+ * E.g. await waitForCondition(() => emailSendMessageSpy.callCount === 1)
+ * @param {() => boolean | Promise<boolean>} cond
+ * @param {*} options: { timeout, delay }
+ * @returns {Promise}
+ */
+export const waitForCondition = async (
+  cond,
+  options: {
+    timeout?: number;
+    delay?: number;
+    onFailure?: () => void;
+  } = {},
+) => {
+  const timeout = options?.timeout || 10000;
+  let time = 0;
+  while (time < timeout) {
+    const condReturn = cond();
+    const result = typeof condReturn?.then === 'function' ? await condReturn : condReturn;
+    if (result) {
+      return result;
+    } else {
+      await sleep(100);
+      time += 100;
+    }
+  }
+
+  options.onFailure?.();
+  assert.fail(`Timeout waiting for condition: ${cond.toString()}`);
+  throw new Error('Timeout waiting for condition', cond);
+};
+
+type EmailMatcher = {
+  /** @default eq */
+  op?: 'eq' | 'contains' | 'startsWith' | 'endsWith';
+} & ({ to: string } | { subject: string } | { text: string } | { html: string } | { bcc: string } | { listId: string });
+
+/**
+ * A specialization of `waitForCondition` that waits for an email
+ */
+export const waitForEmail = async (
+  emailSpy: sinon.Spy,
+  matchers: EmailMatcher | EmailMatcher[],
+  {
+    timeout = 10000,
+    matcherStrategy = 'every',
+  }: {
+    timeout?: number;
+    matcherStrategy?: 'every' | 'some';
+  } = {},
+) => {
+  const matchersArray = Array.isArray(matchers) ? matchers : [matchers];
+  return waitForCondition(
+    () =>
+      emailSpy.args?.find(email => {
+        return matchersArray[matcherStrategy](matcher => {
+          const [to, subject, html, meta] = email;
+          const { text, bcc, listId } = meta;
+          const allValues = { to, subject, text, html, bcc, listId };
+          const valueKeys = Object.keys(matcher).filter(k => k !== 'op');
+          return valueKeys.every(valueKey => {
+            const value = allValues[valueKey];
+            if (typeof value !== 'string') {
+              return false;
+            }
+
+            switch (matcher.op) {
+              case 'contains':
+                return value.includes(matcher[valueKey]);
+              case 'startsWith':
+                return value.startsWith(matcher[valueKey]);
+              case 'endsWith':
+                return value.endsWith(matcher[valueKey]);
+              default:
+                return value === matcher[valueKey];
+            }
+          });
+        });
+      }),
+    {
+      timeout: timeout,
+      onFailure: () => {
+        assert.fail(
+          `Email not found with matchers: ${JSON.stringify(matchers)} in ${emailSpy.args?.length ? JSON.stringify(emailSpy.args) : 'an empty inbox'}`,
+        );
+      },
+    },
+  );
+};
+
+/**
+ * This function allows to test queries and mutations against a specific schema.
+ * @param {string} query - Queries and Mutations to serve against the type schema. Example: `query Expense($id: Int!) { Expense(id: $id) { description } }`
+ * @param {object} variables - Variables to use in the queries and mutations. Example: { id: 1 }
+ * @param {object} remoteUser - The user to add to the context. It is not required.
+ * @param {object} schema - Schema to which queries and mutations will be served against. Schema v1 by default.
+ */
+export const graphqlQuery = async (
+  query,
+  variables = null,
+  remoteUser = null,
+  schema = schemaV1,
+  jwtPayload = null,
+  headers = null,
+  userToken = null,
+  personalToken = null,
+) => {
+  const prepare = () => {
+    if (remoteUser) {
+      remoteUser.rolesByCollectiveId = null; // force refetching the roles
+      return remoteUser.populateRoles();
+    } else {
+      return Promise.resolve();
+    }
+  };
+
+  if (process.env.DEBUG && process.env.DEBUG.match(/graphql/)) {
+    debug('graphql')('query', query);
+    debug('graphql')('variables', variables);
+    debug('graphql')('context', remoteUser);
+  }
+
+  return prepare().then(() =>
+    graphql({
+      schema,
+      source: query,
+      rootValue: null,
+      contextValue: makeRequest(remoteUser, query, jwtPayload, headers, userToken, personalToken),
+      variableValues: variables,
+    }),
+  );
+};
+
+/**
+ * This function allows to test queries and mutations against schema v2.
+ * @param {string} query - Queries and Mutations to serve against the type schema. Example: `query Expense($id: Int!) { Expense(id: $id) { description } }`
+ * @param {object} variables - Variables to use in the queries and mutations. Example: { id: 1 }
+ * @param {object} remoteUser - The user to add to the context. It is not required.
+ */
+export async function graphqlQueryV2(
+  query,
+  variables,
+  remoteUser = null,
+  jwtPayload = null,
+  headers = {},
+  userToken = undefined,
+  personalToken = undefined,
+) {
+  return graphqlQuery(query, variables, remoteUser, schemaV2, jwtPayload, headers, userToken, personalToken);
+}
+
+/**
+ * This function allows to test queries and mutations against schema v2.
+ * @param {string} query - Queries and Mutations to serve against the type schema. Example: `query Expense($id: Int!) { Expense(id: $id) { description } }`
+ * @param {object} variables - Variables to use in the queries and mutations. Example: { id: 1 }
+ * @param {object} userToken - The user token to add to the context.
+ */
+export async function oAuthGraphqlQueryV2(
+  query,
+  variables,
+  userToken: UserToken = null,
+  jwtPayload = null,
+  headers = {},
+) {
+  return graphqlQuery(query, variables, userToken?.user, schemaV2, jwtPayload, headers, userToken);
+}
+
+/**
+ * This function allows to test queries and mutations against schema v2.
+ * @param {string} query - Queries and Mutations to serve against the type schema. Example: `query Expense($id: Int!) { Expense(id: $id) { description } }`
+ * @param {object} variables - Variables to use in the queries and mutations. Example: { id: 1 }
+ * @param {object} personalToken - The personal token to add to the context.
+ */
+export async function personalTokenGraphqlQueryV2(query, variables, personalToken, jwtPayload = null, headers = {}) {
+  return graphqlQuery(query, variables, personalToken.user, schemaV2, jwtPayload, headers, null, personalToken);
+}
+
+export const getTerminalCols = () => {
+  let length = 40;
+  if (process.platform === 'win32') {
+    return length;
+  }
+  try {
+    length = parseInt(execSync('tput cols').toString());
+  } catch {
+    // Just catch and return length
+  }
+  return length;
+};
+
+export const separator = length => {
+  const terminalCols = length || getTerminalCols();
+
+  let separator = '';
+  for (let i = 0; i < terminalCols; i++) {
+    separator += '-';
+  }
+  console.log(`\n${separator}\n`);
+};
+
+/* ---- Stripe Helpers ---- */
+
+/** Stub Stripe methods used while creating transactions
+ *
+ * @param {sinon.sandbox} sandbox is the sandbox that the test created
+ *  and the one that *must* be reset after the test is done.
+ */
+export function stubStripeCreate(
+  sandbox,
+  overloadDefaults = {},
+  { skipPaymentIntents = false }: { skipPaymentIntents?: boolean } = {},
+) {
+  const paymentMethodId = randStr('pm_');
+  const values = {
+    customer: { id: 'cus_BM7mGwp1Ea8RtL' },
+    token: { id: 'tok_1AzPXGD8MNtzsDcgwaltZuvp' },
+    charge: { id: 'ch_1AzPXHD8MNtzsDcgXpUhv4pm' },
+    paymentIntent: { id: 'pi_1F82vtBYycQg1OMfS2Rctiau', status: 'requires_confirmation' },
+    paymentIntentConfirmed: { charges: { data: [{ id: 'ch_1AzPXHD8MNtzsDcgXpUhv4pm' }] }, status: 'succeeded' },
+    paymentMethod: { id: paymentMethodId, type: 'card', card: { fingerprint: 'fingerprint' } },
+    ...overloadDefaults,
+  };
+  /* Little helper function that returns the stub with a given
+   * value. */
+  const factory = name => async () => values[name];
+  sandbox.stub(stripe.tokens, 'create').callsFake(factory('token'));
+
+  sandbox.stub(stripe.customers, 'create').callsFake(factory('customer'));
+  sandbox.stub(stripe.customers, 'retrieve').callsFake(factory('customer'));
+  if (!skipPaymentIntents) {
+    sandbox.stub(stripe.paymentIntents, 'create').callsFake(factory('paymentIntent'));
+    sandbox.stub(stripe.paymentIntents, 'confirm').callsFake(factory('paymentIntentConfirmed'));
+  }
+  sandbox.stub(stripe.paymentMethods, 'create').callsFake(factory('paymentMethod'));
+  sandbox.stub(stripe.paymentMethods, 'attach').callsFake(factory('paymentMethod'));
+}
+
+export function stubStripeBalance(sandbox, amount, currency, applicationFee = 0, stripeFee = 0) {
+  const feeDetails = [];
+  const fee = applicationFee + stripeFee;
+  if (applicationFee && applicationFee > 0) {
+    feeDetails.push({ type: 'application_fee', amount: applicationFee });
+  }
+  if (stripeFee && stripeFee > 0) {
+    feeDetails.push({ type: 'stripe_fee', amount: stripeFee });
+  }
+
+  const balanceTransaction = {
+    id: 'txn_1Bs9EEBYycQg1OMfTR33Y5Xr',
+    object: 'balance_transaction',
+    amount: convertToStripeAmount(currency, amount),
+    currency: currency.toLowerCase(),
+    fee,
+    fee_details: feeDetails,
+    net: convertToStripeAmount(currency, amount - fee),
+    status: 'pending',
+    type: 'charge',
+  };
+  sandbox.stub(stripe.balanceTransactions, 'retrieve').callsFake(() => Promise.resolve(balanceTransaction));
+}
+
+/**
+ * Stubs paymentIntents create/confirm and balanceTransactions.retrieve so the balance
+ * transaction amount/currency match what createChargeTransactions reads from Stripe
+ * (must match the PaymentIntent amount from stripe.paymentIntents.create).
+ *
+ * @warning This function is not concurrent-safe! It uses global state to track the last stripe amount and currency. Do not use it in parallel tests.
+ */
+export function stubStripeBalanceSyncWithPaymentIntent(
+  sandbox,
+  {
+    applicationFee = 0,
+    stripeFee = 0,
+    defaultStripeAmount = 5000,
+    defaultCurrency = 'usd',
+  }: {
+    applicationFee?: number;
+    stripeFee?: number;
+    defaultStripeAmount?: number;
+    defaultCurrency?: string;
+  } = {},
+) {
+  let lastStripeAmount: number | undefined;
+  let lastCurrency: string | undefined;
+  const fee = applicationFee + stripeFee;
+  const feeDetails: Array<{ type: string; amount: number }> = [];
+  if (applicationFee > 0) {
+    feeDetails.push({ type: 'application_fee', amount: applicationFee });
+  }
+  if (stripeFee > 0) {
+    feeDetails.push({ type: 'stripe_fee', amount: stripeFee });
+  }
+
+  sandbox.stub(stripe.paymentIntents, 'create').callsFake((params: { amount: number; currency: string }) => {
+    lastStripeAmount = params.amount;
+    lastCurrency = params.currency;
+    return Promise.resolve({ id: 'pi_test', status: 'requires_confirmation' });
+  });
+  sandbox.stub(stripe.paymentIntents, 'confirm').callsFake(() =>
+    Promise.resolve({
+      id: 'pi_test',
+      status: 'succeeded',
+      charges: {
+        data: [{ id: 'ch_id', balance_transaction: 'txn_id' }],
+      },
+    }),
+  );
+  sandbox.stub(stripe.balanceTransactions, 'retrieve').callsFake(() => {
+    const amount = lastStripeAmount ?? defaultStripeAmount;
+    const currency = (lastCurrency || defaultCurrency).toLowerCase();
+    return Promise.resolve({
+      id: 'txn_1Bs9EEBYycQg1OMfTR33Y5Xr',
+      object: 'balance_transaction',
+      amount,
+      currency,
+      fee,
+      fee_details: feeDetails,
+      net: amount - fee,
+      status: 'pending',
+      type: 'charge',
+    });
+  });
+}
+
+export function expectNoErrorsFromResult(res) {
+  res.errors && console.error(res.errors);
+  expect(res.errors).to.not.exist;
+}
+
+/**
+ * traverse callback function definition.
+ * This callback will be called for every property of object.
+ * https://jsdoc.app/tags-param.html#callback-functions
+ *
+ * @callback PropertyCallback
+ * @param {string} key - Object key.
+ * @param {*} value - Object value at the given key.
+ */
+
+/**
+ * Traverse an object and call cb for every property.
+ * @param {object} obj - Object to traverse.
+ * @param {PropertyCallback} cb - Callback function to be called for every property of obj.
+ */
+export function traverse(obj, cb) {
+  for (const key in obj) {
+    if (obj[key] && typeof obj[key] === 'object') {
+      traverse(obj[key], cb);
+    } else {
+      cb(key, obj[key]);
+    }
+  }
+}
+
+export const prettifyTransactionsData = (transactions, columns, opts = null) => {
+  // Alias some columns for a simpler output
+  const TRANSACTION_KEY_ALIASES = {
+    HostCollectiveId: 'Host',
+    FromCollectiveId: 'From',
+    CollectiveId: 'To',
+    settlementStatus: 'Settlement',
+    TransactionGroup: 'Group',
+    paymentProcessorFeeInHostCurrency: 'paymentFee',
+    platformFeeInHostCurrency: 'platformFee',
+    taxAmount: 'tax',
+  };
+
+  // Prettify values
+  const aliasDBId = value => (value ? `#${value}` : 'NULL');
+  const prettifyValue = (key, value, transaction) => {
+    if (opts?.prettyAmounts) {
+      if (['amount', 'taxAmount'].includes(key)) {
+        return formatCurrency(value, transaction.currency);
+      } else if (key === 'netAmountInCollectiveCurrency' && transaction.collective?.currency) {
+        return formatCurrency(value, transaction.collective.currency);
+      } else if (
+        [
+          'paymentProcessorFeeInHostCurrency',
+          'platformFeeInHostCurrency',
+          'hostFeeInHostCurrency',
+          'amountInHostCurrency',
+        ].includes(key)
+      ) {
+        return formatCurrency(value, transaction.hostCurrency);
+      }
+    }
+
+    switch (key) {
+      case 'HostCollectiveId':
+        return transaction.host?.name || aliasDBId(value);
+      case 'CollectiveId':
+        return transaction.collective?.name || aliasDBId(value);
+      case 'FromCollectiveId':
+        return transaction.fromCollective?.name || aliasDBId(value);
+      case 'TransactionGroup':
+        return `#${value.split('-')[0]}`; // No need to display the full UUID
+      default:
+        return value;
+    }
+  };
+
+  if (columns) {
+    return transactions.map(transaction => {
+      const cleanDataValues = {};
+      columns.forEach(key => {
+        const label = TRANSACTION_KEY_ALIASES[key] || key;
+        const value = get(transaction.dataValues, key);
+        cleanDataValues[label] = prettifyValue(key, value, transaction);
+      });
+
+      return cleanDataValues;
+    });
+  } else {
+    return transactions.map(transaction => {
+      const cleanDataValues = {};
+      Object.entries(transaction.dataValues).forEach(([key, value]) => {
+        const label = TRANSACTION_KEY_ALIASES[key] || key;
+        cleanDataValues[label] = prettifyValue(key, value, transaction);
+      });
+
+      return cleanDataValues;
+    });
+  }
+};
+
+/**
+ * Create a nock for Fixer.io at given rate
+ */
+/**
+ * Directly seeds the cache with FX rates, using the same key format as `lib/currency.ts`.
+ * This is an alternative to `nockFixerRates` that bypasses HTTP entirely.
+ *
+ * @param ratesConfig - A nested map of { [fromCurrency]: { [toCurrency]: rate } }
+ * @param date - The date key to use (defaults to 'latest')
+ */
+export const seedCachedRates = async (
+  ratesConfig: Record<string, Record<string, number>>,
+  date = 'latest',
+): Promise<void> => {
+  for (const [fromCurrency, targets] of Object.entries(ratesConfig)) {
+    for (const [toCurrency, rate] of Object.entries(targets)) {
+      await cache.set(`${date}-${fromCurrency}-${toCurrency}`, rate);
+    }
+  }
+};
+
+export const nockFixerRates = ratesConfig => {
+  nock('https://data.fixer.io')
+    .persist()
+    .get(/.*/)
+    .query(({ base, symbols }: { base: string; symbols: string }) => {
+      const splitSymbols = symbols.split(',');
+      if (splitSymbols.every(symbol => Boolean(ratesConfig[base][symbol]))) {
+        logger.debug(`Fixer: Returning mock value for ${base} -> ${symbols}`);
+        return true;
+      } else {
+        return false;
+      }
+    })
+    .reply(url => {
+      const { base, symbols } = querystring.parse(url) as { base: string; symbols: string };
+      return [
+        200,
+        {
+          base,
+          date: '2021-06-01',
+          rates: symbols.split(',').reduce((rates, symbol) => {
+            rates[symbol] = ratesConfig[base][symbol];
+            return rates;
+          }, {}),
+        },
+      ];
+    });
+};
+
+/**
+ * Preload associations for Transactions to produce prettier snapshots.
+ * Only support loading collectives at the moment.
+ */
+export const preloadAssociationsForTransactions = async (transactions, columns) => {
+  // Define the fields to preload
+  const mapOfFieldsToPreload = {
+    CollectiveId: 'collective',
+    FromCollectiveId: 'fromCollective',
+    HostCollectiveId: 'host',
+  };
+
+  Object.keys(mapOfFieldsToPreload).forEach(key => {
+    if (!columns.includes(key)) {
+      delete mapOfFieldsToPreload[key];
+    }
+  });
+
+  // Aggregate association IDs
+  const fieldsToPreload = Object.keys(mapOfFieldsToPreload);
+  const collectiveIds = new Set([]);
+  transactions.forEach(transaction => {
+    fieldsToPreload.forEach(field => {
+      const primaryKey = transaction.getDataValue(field);
+      if (primaryKey) {
+        collectiveIds.add(primaryKey);
+      }
+    });
+  });
+
+  // Load associations
+  const collectives = await models.Collective.findAll({ where: { id: Array.from(collectiveIds) } });
+  const groupedCollectives = groupBy(collectives, 'id');
+
+  // Bind associations
+  transactions.forEach(transaction => {
+    fieldsToPreload.forEach(field => {
+      const primaryKey = transaction.getDataValue(field);
+      if (primaryKey && groupedCollectives[primaryKey]) {
+        const targetFieldName = mapOfFieldsToPreload[field];
+        transaction[targetFieldName] = groupedCollectives[primaryKey][0];
+      }
+    });
+  });
+};
+
+/**
+ * An helper to display a list of transactions on the console in a pretty markdown table.
+ */
+export const printTransactions = async (transactions, columns = ['type', 'amount', 'CollectiveId', 'kind']) => {
+  await preloadAssociationsForTransactions(transactions, columns);
+  const prettyTransactions = prettifyTransactionsData(transactions, columns, { prettyAmounts: true });
+  const headers = Object.keys(prettyTransactions[0]);
+  console.log(markdownTable([headers, ...prettyTransactions.map(Object.values)]));
+};
+
+/**
+ * An helper to display the ledger content on the console in a pretty markdown table.
+ */
+export const printLedger = async (columns = ['type', 'amount', 'CollectiveId', 'kind']) => {
+  const allTransactions = await models.Transaction.findAll();
+  await printTransactions(allTransactions, columns);
+};
+
+/**
+ * Generate a snapshot using a markdown table, aliasing columns for a prettier output.
+ * If associations (collective, host, ...etc) are loaded, their names will be used for the output.
+ */
+export const snapshotTransactions = (
+  transactions,
+  params: {
+    columns?: string[];
+    prettyAmounts?: boolean;
+  } = {},
+) => {
+  if (!transactions?.length) {
+    throw new Error('snapshotTransactions does not support empty arrays');
+  }
+
+  expect(prettifyTransactionsData(transactions, params.columns, omit(params, 'columns'))).to.matchTableSnapshot();
+};
+
+/**
+ * Makes a full snapshot of the ledger
+ */
+export const snapshotLedger = async (
+  columns,
+  {
+    where = null,
+    order = [['id', 'DESC']],
+  }: {
+    where?: Parameters<typeof models.Transaction.findAll>[0]['where'];
+    order?: Parameters<typeof models.Transaction.findAll>[0]['order'];
+  } = {},
+) => {
+  const transactions = await models.Transaction.findAll({ where, order });
+  await preloadAssociationsForTransactions(transactions, columns);
+  if (columns.includes('settlementStatus')) {
+    await models.TransactionSettlement.attachStatusesToTransactions(transactions);
+  }
+
+  snapshotTransactions(transactions, { columns: columns });
+};
+
+export const getApolloErrorCode = call => call.catch(e => e?.extensions?.code);
+
+export const generateValid2FAHeader = user => {
+  if (!user.twoFactorAuthToken) {
+    return null;
+  }
+
+  const decryptedToken = crypto.decrypt(user.twoFactorAuthToken).toString();
+  const twoFactorAuthenticatorCode = generateSync({
+    secret: decryptedToken,
+    algorithm: 'sha1',
+    strategy: 'totp',
+  });
+
+  return `totp ${twoFactorAuthenticatorCode}`;
+};
+
+export const useIntegrationTestRecorder = (baseUrl, testFileName, preProcessNocks = x => x) => {
+  if (process.env.RECORD) {
+    nock.recorder.rec({
+      output_objects: true,
+      dont_print: true,
+    });
+  }
+  const recordFile = `${testFileName}.responses.json`;
+
+  before(() => {
+    if (process.env.RECORD) {
+      nock(baseUrl);
+    } else {
+      nock.cleanAll();
+      const nocks = nock.loadDefs(recordFile).map(preProcessNocks);
+      nock.define(nocks);
+    }
+  });
+
+  after(() => {
+    if (process.env.RECORD) {
+      const nockCalls = nock.recorder.play();
+      fs.writeFileSync(recordFile, JSON.stringify(nockCalls, null, 2));
+    }
+    nock.cleanAll();
+    nock.restore();
+  });
+};
+
+export const getMockFileUpload = (
+  mockFile:
+    | 'images/camera.png'
+    | 'images/empty.jpg'
+    | 'images/corrupt.jpg'
+    | 'files/transactions.csv' = 'images/camera.png',
+  { simulatedSize }: { simulatedSize?: number } = {},
+) => {
+  const file = new Upload();
+  const mimeType = mockFile.includes('.csv') ? 'text/csv' : mockFile.includes('.png') ? 'image/png' : 'image/jpeg';
+
+  file.promise = Promise.resolve({
+    filename: mockFile,
+    mimetype: mimeType,
+    encoding: 'binary',
+    createReadStream: () => {
+      const stream = new Readable();
+      const imagePath = path.join(__dirname, `./mocks/${mockFile}`);
+      const fileContent = fs.readFileSync(imagePath);
+      stream.push(fileContent);
+      if (simulatedSize) {
+        const padding = Buffer.alloc(simulatedSize - fileContent.length);
+        stream.push(padding);
+      }
+
+      stream.push(null);
+      return stream;
+    },
+  });
+
+  return file;
+};
+
+export const getOrCreatePlatformAccount = async () => {
+  let platform = await models.Collective.findByPk(PlatformConstants.PlatformCollectiveId);
+  if (!platform) {
+    platform = await fakeActiveHost({ id: PlatformConstants.PlatformCollectiveId, name: 'OfiTest Platform Account' });
+  }
+
+  return platform;
+};

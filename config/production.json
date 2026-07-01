@@ -1,0 +1,93 @@
+{
+  "database": {
+    "options": {
+      "logging": true,
+      "pool": {
+        "min": 10,
+        "max": 50,
+        "acquire": 60000
+      },
+      "dialectOptions": {
+        "ssl": {
+          "rejectUnauthorized": false
+        }
+      },
+      "benchmark": true
+    }
+  },
+  "host": {
+    "api": "https://api.opencollective.com",
+    "frontend": "https://frontend.opencollective.com",
+    "website": "https://opencollective.com",
+    "images": "https://images.opencollective.com",
+    "pdf": "https://pdf.opencollective.com",
+    "rest": "https://rest.opencollective.com",
+    "ml": "https://ml.opencollective.com",
+    "webhooks": "https://api.opencollective.com/webhooks"
+  },
+  "log": {
+    "slowRequest": true
+  },
+  "stripe": {
+    "redirectUri": "https://opencollective.com/services/stripe/oauth/callback",
+    "oneTimePaymentMethodConfiguration": "pmc_1PP2hRDjPFcHOcTmxglZrPCg",
+    "recurringPaymentMethodConfiguration": "pmc_1PP2kwDjPFcHOcTmsXkafnkI"
+  },
+  "paypal": {
+    "payment": {
+      "environment": "production"
+    },
+    "connect": {
+      "redirectUri": "https://opencollective.com/services/paypal/oauth/callback"
+    }
+  },
+  "transferwise": {
+    "apiUrl": "https://api.wise.com",
+    "oauthUrl": "https://wise.com",
+    "redirectUri": "https://opencollective.com/services/transferwise/oauth/callback"
+  },
+  "pdfService": {
+    "fetchTransactionsReceipts": true
+  },
+  "restService": {
+    "fetchCollectiveTransactionsCsv": true,
+    "fetchHostTransactionsCsv": true
+  },
+  "sentry": {
+    "tracesSampleRate": 0.01,
+    "profilesSampleRate": 0.02
+  },
+  "graphql": {
+    "cache": {
+      "enabled": true
+    }
+  },
+  "captcha": {
+    "enabled": true
+  },
+  "webauthn": {
+    "rpName": "Open Collective",
+    "rpId": "opencollective.com",
+    "expectedOrigins": ["https://opencollective.com"]
+  },
+  "performance": {
+    "hostsWithManyTransactions": [
+      11004, // OSC
+      8686, // OC
+      11049, // OCF
+      98478, // SCN
+      9807, // OCE
+      73495, // AFC
+      845576 // Ofitech
+    ],
+    "collectivesWithManyTransactions": [
+      11004, // OSC
+      8686, // OC
+      11049, // OCF
+      166914, // Logseq
+      9807, // OCE
+      73495, // AFC
+      845576 // Ofitech
+    ]
+  }
+}

@@ -1,0 +1,811 @@
+import { expect } from 'chai';
+import gql from 'fake-tag';
+import { describe, it } from 'mocha';
+import { assert, createSandbox } from 'sinon';
+
+import { roles } from '../../../../../server/constants';
+import ActivityTypes from '../../../../../server/constants/activities';
+import ExpenseStatuses from '../../../../../server/constants/expense-status';
+import { idDecode, idEncode } from '../../../../../server/graphql/v2/identifiers';
+import emailLib from '../../../../../server/lib/email';
+import { EntityPublicId, EntityShortIdPrefix } from '../../../../../server/lib/permalink/entity-map';
+import models from '../../../../../server/models';
+import { CommentType } from '../../../../../server/models/Comment';
+import {
+  fakeActiveHost,
+  fakeCollective,
+  fakeComment,
+  fakeExpense,
+  fakeHostApplication,
+  fakeMember,
+  fakeProject,
+  fakeUser,
+} from '../../../../test-helpers/fake-data';
+import * as utils from '../../../../utils';
+
+describe('test/server/graphql/v2/mutation/CommentMutations', () => {
+  let validCommentData, collective, expense, admin, hostAdmin, expenseSubmitter, host;
+
+  before(async () => {
+    await utils.resetTestDB();
+    admin = await fakeUser(undefined, { name: 'The Collective Admin' });
+    hostAdmin = await fakeUser(undefined, { name: 'The Host Admin' });
+    expenseSubmitter = await fakeUser(undefined, { name: 'The Expense Submitter' });
+    host = await fakeActiveHost({ name: 'Test Host', admin: hostAdmin.collective });
+    collective = await fakeCollective({ admin: admin.collective, HostCollectiveId: host.id });
+    expense = await fakeExpense({
+      FromCollectiveId: expenseSubmitter.CollectiveId,
+      UserId: expenseSubmitter.id,
+      CollectiveId: collective.id,
+      description: 'Test expense mutations',
+    });
+    validCommentData = {
+      html: '<p>This is the <strong>comment</strong></p>',
+      expense: { legacyId: expense.id },
+    };
+  });
+
+  describe('create a comment', () => {
+    let sandbox, sendEmailSpy;
+    const createCommentMutation = gql`
+      mutation CreateComment($comment: CommentCreateInput!) {
+        createComment(comment: $comment) {
+          id
+          html
+        }
+      }
+    `;
+
+    beforeEach(() => {
+      sandbox = createSandbox();
+      sendEmailSpy = sandbox.spy(emailLib, 'sendMessage');
+    });
+
+    afterEach(() => {
+      sandbox.restore();
+    });
+
+    it('fails if not authenticated', async () => {
+      const result = await utils.graphqlQueryV2(createCommentMutation, { comment: validCommentData });
+      expect(result.errors).to.have.length(1);
+      expect(result.errors[0].message).to.equal('You must be logged in to create a comment');
+    });
+
+    it('creates a comment & sends an email', async () => {
+      const parentCollective = await fakeCollective({
+        name: 'The P@rent Collective',
+        admin: admin,
+        HostCollectiveId: host.id,
+      });
+      const project = await fakeProject({
+        name: 'The Pr0ject',
+        ParentCollectiveId: parentCollective.id,
+        HostCollectiveId: host.id,
+      });
+      const anotherProjectAdmin = await fakeUser();
+      await project.addUserWithRole(anotherProjectAdmin, roles.ADMIN);
+      const payee = await fakeUser(undefined, { name: 'The Payee' });
+      const expense = await fakeExpense({
+        FromCollectiveId: payee.CollectiveId,
+        UserId: expenseSubmitter.id,
+        CollectiveId: project.id,
+        description: 'Test expense mutations',
+      });
+      const commentData = {
+        ...validCommentData,
+        expense: { legacyId: expense.id },
+      };
+
+      const result = await utils.graphqlQueryV2(createCommentMutation, { comment: commentData }, anotherProjectAdmin);
+      utils.expectNoErrorsFromResult(result);
+      const createdComment = result.data.createComment;
+      expect(createdComment.html).to.equal('<p>This is the <strong>comment</strong></p>');
+
+      // Creates the activity
+      const activity = await models.Activity.findOne({
+        where: { type: ActivityTypes.EXPENSE_COMMENT_CREATED, ExpenseId: expense.id },
+      });
+      expect(activity).to.exist;
+      expect(activity.data.CommentId).to.equal(idDecode(createdComment.id, 'comment'));
+      expect(activity.data.expense.description).to.equal(expense.description);
+      expect(activity.data.collective.name).to.equal(project.name);
+      expect(activity.data.fromCollective.name).to.equal(payee.collective.name);
+      expect(activity.FromCollectiveId).to.equal(anotherProjectAdmin.CollectiveId);
+
+      // Sends an email
+      await utils.waitForCondition(() => sendEmailSpy.callCount === 4);
+      expect(sendEmailSpy.callCount).to.equal(4);
+      const expectedTitle = `${project.name}: New comment on expense ${expense.description} by ${anotherProjectAdmin.collective.name}`;
+      assert.calledWithMatch(sendEmailSpy, hostAdmin.email, expectedTitle);
+      assert.calledWithMatch(sendEmailSpy, admin.email, expectedTitle);
+      assert.calledWithMatch(sendEmailSpy, expenseSubmitter.email, expectedTitle);
+      assert.calledWithMatch(sendEmailSpy, payee.email, expectedTitle);
+
+      // General fields
+      expect(sendEmailSpy.args[0][2]).to.include('Expense Info');
+      expect(sendEmailSpy.args[0][3].text).to.include('Fiscal Host: Test Host');
+      expect(sendEmailSpy.args[0][3].text).to.include('Collective: The P@rent Collective → The Pr0ject');
+      expect(sendEmailSpy.args[0][3].text).to.include('Payee: The Payee');
+      expect(sendEmailSpy.args[0][3].text).to.include('Status: Pending');
+    });
+
+    it('creates private notes without notifying users out of context', async () => {
+      const anotherHostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: anotherHostAdmin.CollectiveId, role: roles.ADMIN });
+      const result = await utils.graphqlQueryV2(
+        createCommentMutation,
+        { comment: { ...validCommentData, type: CommentType.PRIVATE_NOTE } },
+        hostAdmin,
+      );
+      utils.expectNoErrorsFromResult(result);
+      const createdComment = result.data.createComment;
+      expect(createdComment.html).to.equal('<p>This is the <strong>comment</strong></p>');
+
+      // Creates the activity
+      const activity = await models.Activity.findOne({
+        where: { type: ActivityTypes.EXPENSE_COMMENT_CREATED, ExpenseId: expense.id },
+        order: [['createdAt', 'DESC']],
+      });
+      expect(activity).to.exist;
+      expect(activity.data.CommentId).to.equal(idDecode(createdComment.id, 'comment'));
+      expect(activity.data.comment.type).to.equal(CommentType.PRIVATE_NOTE);
+
+      // Sends an email
+      await utils.waitForCondition(() => sendEmailSpy.callCount === 1);
+      const expectedTitle = `${collective.name}: New comment on expense ${expense.description} by ${hostAdmin.collective.name}`;
+      assert.neverCalledWithMatch(sendEmailSpy, admin.email);
+      assert.neverCalledWithMatch(sendEmailSpy, expenseSubmitter.email);
+      assert.calledWithMatch(sendEmailSpy, anotherHostAdmin.email, expectedTitle);
+    });
+
+    it('creates a host application comment from the applicant and notifies the host admin', async () => {
+      const host = await fakeActiveHost();
+      const hostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: hostAdmin.CollectiveId, role: roles.ADMIN });
+
+      const collectiveAdmin = await fakeUser();
+      const applyingCollective = await fakeCollective({
+        HostCollectiveId: host.id,
+        admin: collectiveAdmin,
+        isActive: false,
+        approvedAt: null,
+      });
+      const hostApplication = await fakeHostApplication({
+        CollectiveId: applyingCollective.id,
+        HostCollectiveId: host.id,
+      });
+
+      const hostApplicationCommentInput = {
+        html: '<p>Host application comment</p>',
+        hostApplication: { id: idEncode(hostApplication.id, 'host-application') },
+      };
+
+      const result = await utils.graphqlQueryV2(
+        createCommentMutation,
+        { comment: hostApplicationCommentInput },
+        collectiveAdmin,
+      );
+      utils.expectNoErrorsFromResult(result);
+      const createdComment = result.data.createComment;
+      expect(createdComment.html).to.equal('<p>Host application comment</p>');
+
+      const commentId = idDecode(createdComment.id, 'comment');
+
+      const activity = await models.Activity.findOne({
+        where: {
+          type: ActivityTypes.HOST_APPLICATION_COMMENT_CREATED,
+        },
+        order: [['createdAt', 'DESC']],
+      });
+
+      expect(activity).to.exist;
+      expect(activity.data.CommentId).to.equal(commentId);
+      expect(activity.data.HostApplicationId).to.equal(hostApplication.id);
+      expect(activity.data.host.id).to.equal(host.id);
+      expect(activity.data.collective.id).to.equal(applyingCollective.id);
+
+      await utils.waitForCondition(() => sendEmailSpy.callCount > 0);
+      expect(sendEmailSpy.callCount).to.be.greaterThan(0);
+
+      const isHostAdminEmailSent = sendEmailSpy
+        .getCalls()
+        .some(
+          call => call.args[0] === hostAdmin.email && call.lastArg.template === 'host.application.comment.created.host',
+        );
+      expect(isHostAdminEmailSent).to.be.true;
+    });
+
+    it('creates a host application comment from the host admin and notifies the collective admin', async () => {
+      const host = await fakeActiveHost();
+      const hostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: hostAdmin.CollectiveId, role: roles.ADMIN });
+
+      const collectiveAdmin = await fakeUser();
+      const applyingCollective = await fakeCollective({
+        HostCollectiveId: host.id,
+        admin: collectiveAdmin,
+        isActive: false,
+        approvedAt: null,
+      });
+      const hostApplication = await fakeHostApplication({
+        CollectiveId: applyingCollective.id,
+        HostCollectiveId: host.id,
+      });
+
+      const hostApplicationCommentInput = {
+        html: '<p>Host application comment from host admin</p>',
+        hostApplication: { id: idEncode(hostApplication.id, 'host-application') },
+      };
+
+      const result = await utils.graphqlQueryV2(
+        createCommentMutation,
+        { comment: hostApplicationCommentInput },
+        hostAdmin,
+      );
+      utils.expectNoErrorsFromResult(result);
+      const createdComment = result.data.createComment;
+      expect(createdComment.html).to.equal('<p>Host application comment from host admin</p>');
+
+      const commentId = idDecode(createdComment.id, 'comment');
+
+      const activity = await models.Activity.findOne({
+        where: {
+          type: ActivityTypes.HOST_APPLICATION_COMMENT_CREATED,
+        },
+        order: [['createdAt', 'DESC']],
+      });
+
+      expect(activity).to.exist;
+      expect(activity.data.CommentId).to.equal(commentId);
+      expect(activity.data.HostApplicationId).to.equal(hostApplication.id);
+      expect(activity.data.host.id).to.equal(host.id);
+      expect(activity.data.collective.id).to.equal(applyingCollective.id);
+
+      await utils.waitForCondition(() => sendEmailSpy.callCount > 0);
+      expect(sendEmailSpy.callCount).to.be.greaterThan(0);
+
+      const isCollectiveAdminEmailSent = sendEmailSpy
+        .getCalls()
+        .some(
+          call => call.args[0] === collectiveAdmin.email && call.args[1].includes('New message about your application'),
+        );
+      expect(isCollectiveAdminEmailSent).to.be.true;
+    });
+
+    it('creates a host application PRIVATE_NOTE and does not notify the applicant admin', async () => {
+      const host = await fakeActiveHost();
+      const hostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: hostAdmin.CollectiveId, role: roles.ADMIN });
+      const anotherHostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: anotherHostAdmin.CollectiveId, role: roles.ADMIN });
+
+      const collectiveAdmin = await fakeUser();
+      const applyingCollective = await fakeCollective({
+        HostCollectiveId: host.id,
+        admin: collectiveAdmin,
+        isActive: false,
+        approvedAt: null,
+      });
+      const hostApplication = await fakeHostApplication({
+        CollectiveId: applyingCollective.id,
+        HostCollectiveId: host.id,
+      });
+
+      const result = await utils.graphqlQueryV2(
+        createCommentMutation,
+        {
+          comment: {
+            html: '<p>Host private note</p>',
+            type: CommentType.PRIVATE_NOTE,
+            hostApplication: { id: idEncode(hostApplication.id, 'host-application') },
+          },
+        },
+        hostAdmin,
+      );
+      utils.expectNoErrorsFromResult(result);
+
+      await utils.waitForCondition(() => sendEmailSpy.callCount > 0);
+      assert.neverCalledWithMatch(sendEmailSpy, collectiveAdmin.email);
+      const isOtherHostAdminEmailSent = sendEmailSpy
+        .getCalls()
+        .some(
+          call =>
+            call.args[0] === anotherHostAdmin.email &&
+            call.lastArg.template === 'host.application.comment.created.host',
+        );
+      expect(isOtherHostAdminEmailSent).to.be.true;
+    });
+  });
+
+  describe('host application PRIVATE_NOTE edit and delete', () => {
+    const editCommentMutation = gql`
+      mutation EditComment($comment: CommentUpdateInput!) {
+        editComment(comment: $comment) {
+          id
+          html
+        }
+      }
+    `;
+    const deleteCommentMutation = gql`
+      mutation DeleteComment($id: String!) {
+        deleteComment(id: $id) {
+          id
+        }
+      }
+    `;
+
+    it('prevents applicant admin from editing or deleting a host application PRIVATE_NOTE', async () => {
+      const host = await fakeActiveHost();
+      const hostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: hostAdmin.CollectiveId, role: roles.ADMIN });
+
+      const collectiveAdmin = await fakeUser();
+      const applyingCollective = await fakeCollective({
+        HostCollectiveId: host.id,
+        admin: collectiveAdmin,
+        isActive: false,
+        approvedAt: null,
+      });
+      const hostApplication = await fakeHostApplication({
+        CollectiveId: applyingCollective.id,
+        HostCollectiveId: host.id,
+      });
+      const privateNote = await fakeComment({
+        HostApplicationId: hostApplication.id,
+        FromCollectiveId: hostAdmin.CollectiveId,
+        CollectiveId: applyingCollective.id,
+        CreatedByUserId: hostAdmin.id,
+        type: CommentType.PRIVATE_NOTE,
+        html: '<p>Host private note</p>',
+      });
+
+      const editResult = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(privateNote.id, 'comment'), html: '<p>Applicant overwrite</p>' } },
+        collectiveAdmin,
+      );
+      expect(editResult.errors).to.exist;
+      expect(editResult.errors[0].message).to.equal('You need to be a host admin to edit or delete this comment');
+
+      const deleteResult = await utils.graphqlQueryV2(
+        deleteCommentMutation,
+        { id: idEncode(privateNote.id, 'comment') },
+        collectiveAdmin,
+      );
+      expect(deleteResult.errors).to.exist;
+      expect(deleteResult.errors[0].message).to.equal('You need to be a host admin to edit or delete this comment');
+    });
+
+    it('allows host admin to edit a host application PRIVATE_NOTE', async () => {
+      const host = await fakeActiveHost();
+      const hostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: hostAdmin.CollectiveId, role: roles.ADMIN });
+
+      const collectiveAdmin = await fakeUser();
+      const applyingCollective = await fakeCollective({
+        HostCollectiveId: host.id,
+        admin: collectiveAdmin,
+        isActive: false,
+        approvedAt: null,
+      });
+      const hostApplication = await fakeHostApplication({
+        CollectiveId: applyingCollective.id,
+        HostCollectiveId: host.id,
+      });
+      const privateNote = await fakeComment({
+        HostApplicationId: hostApplication.id,
+        FromCollectiveId: hostAdmin.CollectiveId,
+        CollectiveId: applyingCollective.id,
+        CreatedByUserId: hostAdmin.id,
+        type: CommentType.PRIVATE_NOTE,
+        html: '<p>Host private note</p>',
+      });
+
+      const html = '<p>Updated host private note</p>';
+      const editResult = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(privateNote.id, 'comment'), html } },
+        hostAdmin,
+      );
+      utils.expectNoErrorsFromResult(editResult);
+      expect(editResult.data.editComment.html).to.equal(html);
+    });
+  });
+
+  describe('expense PRIVATE_NOTE edit and delete', () => {
+    const editCommentMutation = gql`
+      mutation EditComment($comment: CommentUpdateInput!) {
+        editComment(comment: $comment) {
+          id
+          html
+        }
+      }
+    `;
+    const deleteCommentMutation = gql`
+      mutation DeleteComment($id: String!) {
+        deleteComment(id: $id) {
+          id
+        }
+      }
+    `;
+
+    it('prevents collective admin from editing or deleting an expense PRIVATE_NOTE', async () => {
+      const host = await fakeActiveHost();
+      const hostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: hostAdmin.CollectiveId, role: roles.ADMIN });
+
+      const collectiveAdmin = await fakeUser();
+      const hostedCollective = await fakeCollective({
+        HostCollectiveId: host.id,
+        admin: collectiveAdmin,
+      });
+      const expense = await fakeExpense({
+        CollectiveId: hostedCollective.id,
+        status: ExpenseStatuses.APPROVED,
+      });
+      const privateNote = await fakeComment({
+        ExpenseId: expense.id,
+        FromCollectiveId: hostAdmin.CollectiveId,
+        CollectiveId: hostedCollective.id,
+        CreatedByUserId: hostAdmin.id,
+        type: CommentType.PRIVATE_NOTE,
+        html: '<p>Host private expense note</p>',
+      });
+
+      const editResult = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(privateNote.id, 'comment'), html: '<p>Collective overwrite</p>' } },
+        collectiveAdmin,
+      );
+      expect(editResult.errors).to.exist;
+      expect(editResult.errors[0].message).to.equal('You need to be a host admin to edit or delete this comment');
+
+      const deleteResult = await utils.graphqlQueryV2(
+        deleteCommentMutation,
+        { id: idEncode(privateNote.id, 'comment') },
+        collectiveAdmin,
+      );
+      expect(deleteResult.errors).to.exist;
+      expect(deleteResult.errors[0].message).to.equal('You need to be a host admin to edit or delete this comment');
+    });
+
+    it('allows host admin to edit an expense PRIVATE_NOTE', async () => {
+      const host = await fakeActiveHost();
+      const hostAdmin = await fakeUser();
+      await fakeMember({ CollectiveId: host.id, MemberCollectiveId: hostAdmin.CollectiveId, role: roles.ADMIN });
+
+      const collectiveAdmin = await fakeUser();
+      const hostedCollective = await fakeCollective({
+        HostCollectiveId: host.id,
+        admin: collectiveAdmin,
+      });
+      const expense = await fakeExpense({
+        CollectiveId: hostedCollective.id,
+        status: ExpenseStatuses.APPROVED,
+      });
+      const privateNote = await fakeComment({
+        ExpenseId: expense.id,
+        FromCollectiveId: hostAdmin.CollectiveId,
+        CollectiveId: hostedCollective.id,
+        CreatedByUserId: hostAdmin.id,
+        type: CommentType.PRIVATE_NOTE,
+        html: '<p>Host private expense note</p>',
+      });
+
+      const html = '<p>Updated host private expense note</p>';
+      const editResult = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(privateNote.id, 'comment'), html } },
+        hostAdmin,
+      );
+      utils.expectNoErrorsFromResult(editResult);
+      expect(editResult.data.editComment.html).to.equal(html);
+    });
+  });
+
+  describe('edit a comment', () => {
+    let comment;
+    const editCommentMutation = gql`
+      mutation EditComment($comment: CommentUpdateInput!) {
+        editComment(comment: $comment) {
+          id
+          html
+        }
+      }
+    `;
+
+    before(async () => {
+      comment = await fakeComment({
+        ExpenseId: expense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: expense.CollectiveId,
+      });
+    });
+
+    it('fails to delete a comment if not logged in', async () => {
+      const result = await utils.graphqlQueryV2(editCommentMutation, {
+        comment: { id: idEncode(comment.id, 'comment') },
+      });
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal('You must be logged in to edit this comment');
+    });
+
+    it('fails if not authenticated as author or admin of collective', async () => {
+      const user = await fakeUser();
+      const result = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(comment.id, 'comment') } },
+        user,
+      );
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal(
+        'You must be the author, an admin, or a community manager of this collective to edit this comment',
+      );
+    });
+
+    it('fails to edit a comment on an expense that is being processed', async () => {
+      const processingExpense = await fakeExpense({
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: collective.id,
+        status: ExpenseStatuses.PROCESSING,
+      });
+      const processingComment = await fakeComment({
+        ExpenseId: processingExpense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: processingExpense.CollectiveId,
+        CreatedByUserId: admin.id,
+      });
+      const result = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(processingComment.id, 'comment'), html: '<p>Edited</p>' } },
+        admin,
+      );
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal('You cannot edit or delete comments on expenses that are processing');
+    });
+
+    it('fails to edit a comment on an expense that is paid', async () => {
+      const paidExpense = await fakeExpense({
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: collective.id,
+        status: ExpenseStatuses.PAID,
+      });
+      const paidComment = await fakeComment({
+        ExpenseId: paidExpense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: paidExpense.CollectiveId,
+        CreatedByUserId: admin.id,
+      });
+      const result = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(paidComment.id, 'comment'), html: '<p>Edited</p>' } },
+        admin,
+      );
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal('You cannot edit or delete comments on expenses that are paid');
+    });
+
+    it('fails to edit a comment on an expense that is scheduled for payment', async () => {
+      const scheduledExpense = await fakeExpense({
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: collective.id,
+        status: ExpenseStatuses.SCHEDULED_FOR_PAYMENT,
+      });
+      const scheduledComment = await fakeComment({
+        ExpenseId: scheduledExpense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: scheduledExpense.CollectiveId,
+        CreatedByUserId: admin.id,
+      });
+      const result = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(scheduledComment.id, 'comment'), html: '<p>Edited</p>' } },
+        admin,
+      );
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal(
+        'You cannot edit or delete comments on expenses that are scheduled for payment',
+      );
+    });
+
+    it('allows fiscal host admin to edit a comment on a paid expense', async () => {
+      const paidExpense = await fakeExpense({
+        FromCollectiveId: hostAdmin.CollectiveId,
+        CollectiveId: collective.id,
+        status: ExpenseStatuses.PAID,
+      });
+      const paidComment = await fakeComment({
+        ExpenseId: paidExpense.id,
+        FromCollectiveId: hostAdmin.CollectiveId,
+        CollectiveId: paidExpense.CollectiveId,
+        CreatedByUserId: hostAdmin.id,
+      });
+      const html = '<p>Edited by host admin</p>';
+      const result = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(paidComment.id, 'comment'), html } },
+        hostAdmin,
+      );
+      utils.expectNoErrorsFromResult(result);
+      expect(result.data.editComment.html).to.equal(html);
+    });
+
+    it('edits a comment successfully', async () => {
+      const html = '<p>new <em>comment</em> text</p>';
+      const result = await utils.graphqlQueryV2(
+        editCommentMutation,
+        { comment: { id: idEncode(comment.id, 'comment'), html } },
+        admin,
+      );
+      utils.expectNoErrorsFromResult(result);
+
+      // Check the returned edited comment has the correct value.
+      result.errors && console.error(result.errors);
+      expect(result.data.editComment.html).to.equal(html);
+
+      // Check the database has the correct value.
+      const commentFromDb = await models.Comment.findByPk(comment.id);
+      expect(commentFromDb.html).to.equal(html);
+    });
+  });
+
+  describe('delete Comment', () => {
+    let comment;
+    const deleteCommentMutation = gql`
+      mutation DeleteComment($id: String!) {
+        deleteComment(id: $id) {
+          id
+        }
+      }
+    `;
+
+    before(async () => {
+      comment = await fakeComment({
+        ExpenseId: expense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: expense.CollectiveId,
+      });
+    });
+
+    it('fails to delete a comment if not logged in', async () => {
+      const result = await utils.graphqlQueryV2(deleteCommentMutation, { id: idEncode(comment.id, 'comment') });
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal('You must be logged in to delete this comment');
+      return models.Comment.findByPk(comment.id).then(commentFound => {
+        expect(commentFound).to.not.be.null;
+      });
+    });
+
+    it('fails to delete a comment if logged in as another user', async () => {
+      const user = await fakeUser();
+      const result = await utils.graphqlQueryV2(deleteCommentMutation, { id: idEncode(comment.id, 'comment') }, user);
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal(
+        'You need to be logged in as the author, an admin, a community manager, or as a host to delete this comment',
+      );
+      return models.Comment.findByPk(comment.id).then(commentFound => {
+        expect(commentFound).to.not.be.null;
+      });
+    });
+
+    it('fails to delete a comment on an expense that is being processed', async () => {
+      const processingExpense = await fakeExpense({
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: collective.id,
+        status: ExpenseStatuses.PROCESSING,
+      });
+      const processingComment = await fakeComment({
+        ExpenseId: processingExpense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: processingExpense.CollectiveId,
+        CreatedByUserId: admin.id,
+      });
+      const result = await utils.graphqlQueryV2(
+        deleteCommentMutation,
+        { id: idEncode(processingComment.id, 'comment') },
+        admin,
+      );
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal('You cannot edit or delete comments on expenses that are processing');
+      const commentFound = await models.Comment.findByPk(processingComment.id);
+      expect(commentFound).to.not.be.null;
+    });
+
+    it('fails to delete a comment on an expense that is paid', async () => {
+      const paidExpense = await fakeExpense({
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: collective.id,
+        status: ExpenseStatuses.PAID,
+      });
+      const paidComment = await fakeComment({
+        ExpenseId: paidExpense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: paidExpense.CollectiveId,
+        CreatedByUserId: admin.id,
+      });
+      const result = await utils.graphqlQueryV2(
+        deleteCommentMutation,
+        { id: idEncode(paidComment.id, 'comment') },
+        admin,
+      );
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal('You cannot edit or delete comments on expenses that are paid');
+      const commentFound = await models.Comment.findByPk(paidComment.id);
+      expect(commentFound).to.not.be.null;
+    });
+
+    it('fails to delete a comment on an expense that is scheduled for payment', async () => {
+      const scheduledExpense = await fakeExpense({
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: collective.id,
+        status: ExpenseStatuses.SCHEDULED_FOR_PAYMENT,
+      });
+      const scheduledComment = await fakeComment({
+        ExpenseId: scheduledExpense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: scheduledExpense.CollectiveId,
+        CreatedByUserId: admin.id,
+      });
+      const result = await utils.graphqlQueryV2(
+        deleteCommentMutation,
+        { id: idEncode(scheduledComment.id, 'comment') },
+        admin,
+      );
+      expect(result.errors).to.exist;
+      expect(result.errors[0].message).to.equal(
+        'You cannot edit or delete comments on expenses that are scheduled for payment',
+      );
+      const commentFound = await models.Comment.findByPk(scheduledComment.id);
+      expect(commentFound).to.not.be.null;
+    });
+
+    it('allows fiscal host admin to delete a comment on a paid expense', async () => {
+      const paidExpense = await fakeExpense({
+        FromCollectiveId: hostAdmin.CollectiveId,
+        CollectiveId: collective.id,
+        status: ExpenseStatuses.PAID,
+      });
+      const paidComment = await fakeComment({
+        ExpenseId: paidExpense.id,
+        FromCollectiveId: hostAdmin.CollectiveId,
+        CollectiveId: paidExpense.CollectiveId,
+        CreatedByUserId: hostAdmin.id,
+      });
+      const result = await utils.graphqlQueryV2(
+        deleteCommentMutation,
+        { id: idEncode(paidComment.id, 'comment') },
+        hostAdmin,
+      );
+      utils.expectNoErrorsFromResult(result);
+      const commentFound = await models.Comment.findByPk(paidComment.id);
+      expect(commentFound).to.be.null;
+    });
+
+    it('deletes a comment', async () => {
+      const result = await utils.graphqlQueryV2(deleteCommentMutation, { id: idEncode(comment.id, 'comment') }, admin);
+      utils.expectNoErrorsFromResult(result);
+      expect(result.errors).to.not.exist;
+      return models.Comment.findByPk(comment.id).then(commentFound => {
+        expect(commentFound).to.be.null;
+      });
+    });
+
+    it('accepts publicId when deleting a comment', async () => {
+      const anotherComment = await fakeComment({
+        ExpenseId: expense.id,
+        FromCollectiveId: admin.CollectiveId,
+        CollectiveId: expense.CollectiveId,
+      });
+      const publicId =
+        `${EntityShortIdPrefix.Comment}_${anotherComment.id}` as EntityPublicId<EntityShortIdPrefix.Comment>;
+      await anotherComment.update({ publicId });
+
+      const result = await utils.graphqlQueryV2(deleteCommentMutation, { id: publicId }, admin);
+
+      utils.expectNoErrorsFromResult(result);
+      await models.Comment.findByPk(anotherComment.id).then(commentFound => {
+        expect(commentFound).to.be.null;
+      });
+    });
+  });
+});

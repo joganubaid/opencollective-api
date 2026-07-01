@@ -1,0 +1,1671 @@
+/** @module lib/payments */
+import config from 'config';
+import DataLoader from 'dataloader';
+import debugLib from 'debug';
+import { escape, find, get, includes, isNil, isNumber, omit, pick, truncate } from 'lodash';
+import moment from 'moment';
+import { Transaction as SequelizeTransaction } from 'sequelize';
+import { v4 as uuid } from 'uuid';
+
+import activities from '../constants/activities';
+import { CollectiveType } from '../constants/collectives';
+import { SupportedCurrency } from '../constants/currencies';
+import { ExpenseFeesPayer } from '../constants/expense-fees-payer';
+import OrderStatuses from '../constants/order-status';
+import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../constants/paymentMethods';
+import { RefundKind } from '../constants/refund-kind';
+import roles from '../constants/roles';
+import tiers from '../constants/tiers';
+import { TransactionKind } from '../constants/transaction-kind';
+import { TransactionTypes } from '../constants/transactions';
+import { ManualPaymentProvider, Op, sequelize } from '../models';
+import Activity from '../models/Activity';
+import { ManualPaymentProviderTypes, sanitizeManualPaymentProviderInstructions } from '../models/ManualPaymentProvider';
+import Order from '../models/Order';
+import PaymentMethod from '../models/PaymentMethod';
+import Subscription from '../models/Subscription';
+import Transaction, { TransactionCreationAttributes, TransactionData } from '../models/Transaction';
+import TransactionSettlement, { TransactionSettlementStatus } from '../models/TransactionSettlement';
+import User from '../models/User';
+import paymentProviders from '../paymentProviders';
+import {
+  isPaymentProviderWithExternalRecurring,
+  type PaymentProviderService,
+  type PaymentProviderServiceWithInternalRecurringManagement,
+} from '../paymentProviders/types';
+
+import { applyContributionAccountingCategoryRules } from './accounting/categorization/contribution-rules';
+import { notify } from './notifications/email';
+import { syncPaymentIntentFromRefund } from './payment-intents/sync';
+import { getFxRate, roundCentsAmount } from './currency';
+import emailLib from './email';
+import { toNegative } from './math';
+import { getTransactionPdf } from './pdf';
+import { createPrepaidPaymentMethod, isPrepaidBudgetOrder } from './prepaid-budget';
+import { getNextChargeAndPeriodStartDates } from './recurring-contributions';
+import { optsSanitizeOnlyTextFormatting, sanitizeHTML } from './sanitize-html';
+import { reportMessageToSentry } from './sentry';
+import { getDashboardObjectIdURL } from './stripe';
+import { formatAccountDetails } from './transferwise';
+import { getEditRecurringContributionsUrl } from './url-utils';
+import { formatCurrency, toIsoDateStr } from './utils';
+
+const { CREDIT, DEBIT } = TransactionTypes;
+
+const debug = debugLib('payments');
+
+type loaders = Record<string, Record<string, DataLoader<number | string, any>>>;
+
+/** Check if paymentMethod has a given fully qualified name
+ *
+ * Payment Provider names are composed by service and type joined with
+ * a dot. E.g.: `opencollective.giftcard`, `stripe.creditcard`,
+ * etc. This function returns true if a *paymentMethod* instance has a
+ * given *fqn*.
+ *
+ * @param {String} fqn is the fully qualified name to be matched.
+ * @param {PaymentMethod} paymentMethod is the instance that
+ *  will have the fully qualified name compared to the parameter
+ *  *fqn*.
+ * @returns {Boolean} true if *paymentMethod* has a fully qualified
+ *  name that equals *fqn*.
+ * @example
+ * > isProvider('opencollective.giftcard', { service: 'foo', type: 'bar' })
+ * false
+ * > isProvider('stripe.creditcard', { service: 'stripe', type: 'creditcard' })
+ * true
+ */
+export function isProvider(fqn, paymentMethod: PaymentMethod): boolean {
+  const pmFqn = `${paymentMethod.service}.${paymentMethod.type || PAYMENT_METHOD_TYPE.DEFAULT}`;
+  return fqn === pmFqn;
+}
+
+/** Find payment method handler
+ *
+ * @param {PaymentMethod} paymentMethod This must point to a row in the
+ *  `PaymentMethods` table. That information is retrieved and the
+ *  fields `service' & `type' are used to figure out which payment
+ *  {service: 'stripe', type: 'creditcard'}.
+ * @return the payment method's JS module.
+ */
+export function findPaymentMethodProvider(
+  paymentMethod: PaymentMethod,
+  { throwIfMissing = true }: { throwIfMissing?: boolean } = {},
+): PaymentProviderService {
+  const provider = get(paymentMethod, 'service') || PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE;
+  const methodType = get(paymentMethod, 'type') || PAYMENT_METHOD_TYPE.DEFAULT;
+  let paymentMethodProvider = paymentProviders[provider];
+  if (!paymentMethodProvider) {
+    if (throwIfMissing) {
+      throw new Error(`No payment provider found for ${provider}`);
+    } else {
+      return null;
+    }
+  }
+
+  paymentMethodProvider = paymentMethodProvider.types[methodType];
+  if (!paymentMethodProvider && throwIfMissing) {
+    throw new Error(`No payment provider found for ${provider}:${methodType}`);
+  }
+  return paymentMethodProvider;
+}
+
+/** Process an order using its payment information
+ *
+ * @param {Object} order must contain a valid `paymentMethod`
+ *  field. Which means that the query to select the order must include
+ *  the `PaymentMethods` table.
+ */
+export async function processOrder(
+  order: Order,
+  options: { isAddedFund?: boolean; invoiceTemplate?: string } = {},
+): Promise<Transaction | void> {
+  const paymentMethodProvider = findPaymentMethodProvider(order.paymentMethod);
+  if (get(paymentMethodProvider, 'features.waitToCharge') && !get(order, 'paymentMethod.paid')) {
+    return;
+  } else {
+    return paymentMethodProvider.processOrder(order, options);
+  }
+}
+
+/**
+ * Pauses an order, taking care of both the payment provider and the database.
+ * Resume it with `resumeOrder`.
+ *
+ * @param order The order to pause
+ * @param reason The reason why the order is being paused (shared with the user in PayPal's email)
+ */
+export async function pauseOrder(order: Order, reason: string, pausedBy: Order['data']['pausedBy']): Promise<void> {
+  if (order.status === OrderStatuses.PAUSED) {
+    return;
+  } else if (order.status !== OrderStatuses.ACTIVE) {
+    throw new Error(`Order #${order.id} is not active`);
+  }
+
+  // If externally manage subscription, cancel on the payment provider first
+  const paymentMethodProvider = findPaymentMethodProvider(order.paymentMethod);
+  if (isPaymentProviderWithExternalRecurring(paymentMethodProvider)) {
+    await paymentMethodProvider.pauseSubscription(order, reason);
+  }
+
+  // Then pause the order in the database
+  await pauseOrderInDb(order, reason, pausedBy);
+}
+
+export async function pauseOrderInDb(order: Order, reason: string, pausedBy: Order['data']['pausedBy']): Promise<void> {
+  if (order.status === OrderStatuses.PAUSED) {
+    return;
+  }
+
+  await order.update({
+    status: OrderStatuses.PAUSED,
+    data: { ...order.data, messageForContributors: reason, pausedBy },
+  });
+
+  const subscription = order.Subscription || (await order.getSubscription());
+  if (subscription?.isActive) {
+    await order.Subscription.update({
+      isActive: false,
+      deactivatedAt: new Date(),
+    });
+  }
+}
+
+/**
+ * Resumes a previously paused order, taking care of both the payment provider and the database.
+ *
+ * @param order The order to resume
+ * @param reason The reason why the order is being resumed (shared with the user in PayPal's email)
+ */
+export async function resumeOrder(order: Order, reason: string): Promise<void> {
+  if (order.status !== OrderStatuses.PAUSED) {
+    throw new Error(`Order #${order.id} is not paused`);
+  }
+
+  // If externally manage subscription, resume on the payment provider first
+  const paymentMethodProvider = findPaymentMethodProvider(order.paymentMethod);
+  if (isPaymentProviderWithExternalRecurring(paymentMethodProvider)) {
+    const { resumed } = await paymentMethodProvider.resumeSubscription(order, reason);
+    if (!resumed) {
+      throw new Error('Failed to resume contribution');
+    }
+  }
+
+  // Then resume the order in the database
+  await resumeOrderInDb(order, reason);
+}
+
+export async function resumeOrderInDb(order: Order, reason: string): Promise<void> {
+  await order.update({
+    status: OrderStatuses.ACTIVE,
+    data: { ...order.data, resumeReason: reason },
+  });
+
+  const subscription = order.Subscription || (await order.getSubscription());
+  if (subscription) {
+    await order.Subscription.update({
+      isActive: true,
+      deactivatedAt: null,
+      nextChargeDate: moment().isAfter(subscription.nextChargeDate) ? new Date() : subscription.nextChargeDate,
+    });
+  }
+}
+
+/** Refund a transaction
+ *
+ * @param {TransactionInterface} transaction ideally preloaded with a valid `PaymentMethod`
+ *  field. Which means that the query to select it from the DB must
+ *  include the `PaymentMethods` table.
+ * @param {User} user an optional instance of the User model that will be
+ *  associated to the refund transaction as who performed the refund.
+ * @param {string} message a optional message to explain why the transaction is rejected
+ */
+export async function refundTransaction(
+  transaction: Transaction,
+  user?: User,
+  message?: string,
+  refundKind?: RefundKind,
+  { ignoreBalanceCheck = false } = {},
+): Promise<Transaction> {
+  // Make sure to fetch PaymentMethod
+  // Fetch PaymentMethod even if it's deleted
+  if (!transaction.PaymentMethod && transaction.PaymentMethodId) {
+    transaction.PaymentMethod = await PaymentMethod.findByPk(transaction.PaymentMethodId, { paranoid: false });
+  }
+
+  // If no payment method was used, it means that we're using a manual payment method
+  const paymentMethodProvider = transaction.PaymentMethod
+    ? findPaymentMethodProvider(transaction.PaymentMethod)
+    : // TODO: Drop this in favor of findPaymentMethodProvider when persisting PaymentIntents as Payment Methods
+      ['us_bank_account', 'sepa_debit'].includes(transaction.data?.charge?.payment_method_details?.type)
+      ? (paymentProviders.stripe.types.paymentintent as PaymentProviderServiceWithInternalRecurringManagement)
+      : (paymentProviders.opencollective.types.manual as PaymentProviderServiceWithInternalRecurringManagement);
+
+  if (!paymentMethodProvider.refundTransaction) {
+    throw new Error('This payment method provider does not support refunds');
+  }
+
+  let result;
+
+  try {
+    result = await paymentMethodProvider.refundTransaction(transaction, user, message, refundKind, {
+      ignoreBalanceCheck,
+    });
+  } catch (e) {
+    if (
+      (e.message.includes('has already been refunded') || e.message.includes('has been charged back')) &&
+      paymentMethodProvider &&
+      paymentMethodProvider.refundTransactionOnlyInDatabase
+    ) {
+      result = await paymentMethodProvider.refundTransactionOnlyInDatabase(transaction, null, null, refundKind, {
+        ignoreBalanceCheck,
+      });
+    } else {
+      throw e;
+    }
+  }
+
+  return result;
+}
+
+/** Calculates how much an amount's fee is worth.
+ *
+ * @param {Number} amount is the amount of the transaction.
+ * @param {Number} fee is the percentage of the transaction.
+ * @param {SupportedCurrency} currency is the currency of the transaction, used to check the expected number of decimals
+ * @example
+ * calcFee(100, 3.5, 'USD'); // 4
+ * calcFee(10_000, 3.5, 'USD'); // 350
+ * calcFee(10_000, 3.5, 'JPY'); // 400
+ * @return {Number} fee-percent of the amount rounded
+ */
+export function calcFee(amount: number, fee: number, currency: SupportedCurrency): number {
+  return roundCentsAmount((amount * fee) / 100, currency);
+}
+
+const makeRefundDescription = (refundKind: RefundKind, referencedTransaction: Transaction): string => {
+  let description;
+  switch (refundKind) {
+    case RefundKind.REFUND:
+      description = `Refund of "${referencedTransaction.description}`;
+      break;
+    case RefundKind.DISPUTE:
+      description = `Dispute of "${referencedTransaction.description}`;
+      break;
+    case RefundKind.DUPLICATE:
+      description = `Duplicate return of "${referencedTransaction.description}`;
+      break;
+    case RefundKind.REJECT:
+      description = `Rejection of "${referencedTransaction.description}`;
+      break;
+    default:
+      description = `Reverse of "${referencedTransaction.description}`;
+      break;
+  }
+
+  return `${truncate(description, { length: 254 })}"`;
+};
+
+export const buildRefundForTransaction = (
+  t: Transaction,
+  user?: User | null,
+  data?: TransactionData,
+  amounts?: {
+    /** If the payment processor fee is not recorded as a separate transaction, use this field to refund it as part of the main transaction */
+    refundedPaymentProcessorFeeInHostCurrency?: number;
+    /** If the refunded amount is different from the original transaction amount */
+    refundedAmountInHostCurrency?: number;
+  },
+  refundKind?: RefundKind,
+): TransactionCreationAttributes => {
+  const { refundedPaymentProcessorFeeInHostCurrency, refundedAmountInHostCurrency } = amounts || {};
+  const refund = pick(t, [
+    'currency',
+    'FromCollectiveId',
+    'CollectiveId',
+    'HostCollectiveId',
+    'PaymentMethodId',
+    'OrderId',
+    'ExpenseId',
+    'hostCurrencyFxRate',
+    'hostCurrency',
+    'hostFeeInHostCurrency',
+    'platformFeeInHostCurrency',
+    'paymentProcessorFeeInHostCurrency',
+    'taxAmount',
+    'data.hasPlatformTip',
+    'data.tax',
+    'kind',
+    'isDebt',
+    'PayoutMethodId',
+  ]) as TransactionCreationAttributes;
+
+  refund.refundKind = refundKind || RefundKind.REFUND;
+  refund.CreatedByUserId = user?.id || null;
+  refund.description = makeRefundDescription(refund.refundKind, t);
+  refund.data = { ...refund.data, ...data };
+  refund.isRefund = true;
+  refund.hostFeeInHostCurrency = 0; // We're handling host fees in separate transactions
+
+  /* The refund operation moves back fees to the user's ledger so the
+   * fees there should be positive. Since they're usually in negative,
+   * we're just setting them to positive by adding a - sign in front
+   * of it. */
+  refund.platformFeeInHostCurrency = -refund.platformFeeInHostCurrency;
+  refund.paymentProcessorFeeInHostCurrency = -refund.paymentProcessorFeeInHostCurrency;
+  refund.taxAmount = -refund.taxAmount;
+
+  /* Amount fields. Must be calculated after tweaking all the fees */
+  if (isNil(refundedAmountInHostCurrency)) {
+    refund.amount = -t.amount;
+    refund.amountInHostCurrency = -t.amountInHostCurrency;
+    refund.netAmountInCollectiveCurrency = -Transaction.calculateNetAmountInCollectiveCurrency(t);
+  } else {
+    refund.amountInHostCurrency = toNegative(refundedAmountInHostCurrency);
+    refund.amount = roundCentsAmount(refund.amountInHostCurrency / refund.hostCurrencyFxRate, refund.currency);
+    refund.netAmountInCollectiveCurrency = -Transaction.calculateNetAmountInCollectiveCurrency(refund);
+  }
+
+  // Adjust refunded payment processor fee based on the fees payer
+  if (refund.kind === TransactionKind.EXPENSE) {
+    const feesPayer = t.data?.feesPayer || ExpenseFeesPayer.COLLECTIVE;
+    if (feesPayer === ExpenseFeesPayer.PAYEE) {
+      if (refundedPaymentProcessorFeeInHostCurrency && t.paymentProcessorFeeInHostCurrency) {
+        // If the fee gets refunded while set on the column, we add it as a positive value on the refund transactions
+        refund.paymentProcessorFeeInHostCurrency = Math.abs(refundedPaymentProcessorFeeInHostCurrency);
+      } else {
+        // Otherwise, payment processor fees are deducted from the refunded amount which means
+        // the collective will receive the original expense amount minus payment processor fees
+        refund.amountInHostCurrency += Math.abs(t.paymentProcessorFeeInHostCurrency);
+        refund.amount = roundCentsAmount(refund.amountInHostCurrency / refund.hostCurrencyFxRate, refund.currency);
+        refund.paymentProcessorFeeInHostCurrency = 0;
+      }
+    } else if (feesPayer === ExpenseFeesPayer.COLLECTIVE) {
+      refund.amountInHostCurrency += Math.abs(t.paymentProcessorFeeInHostCurrency);
+      refund.amount = roundCentsAmount(refund.amountInHostCurrency / refund.hostCurrencyFxRate, refund.currency);
+      refund.paymentProcessorFeeInHostCurrency = 0;
+    } else {
+      throw new Error(`Refund not supported for feesPayer = '${feesPayer}'`);
+    }
+  } else {
+    refund.paymentProcessorFeeInHostCurrency = 0;
+  }
+
+  // Re-compute the net amount
+  refund.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(refund);
+
+  return refund;
+};
+
+export const refundPaymentProcessorFeeToCollective = async (
+  transaction: Transaction,
+  refundTransactionGroup: string,
+  refundKind?: RefundKind,
+  {
+    data = {},
+    createdAt = null,
+    hostCoverInHostCurrency = null,
+    sqlTransaction = undefined,
+  }: {
+    /** If the refunded amount is different from the original transaction amount */
+    hostCoverInHostCurrency?: number;
+    sqlTransaction?: SequelizeTransaction;
+    createdAt?: Date;
+    data?: { hostFeeMigration?: string };
+  } = {},
+): Promise<void> => {
+  if (transaction.CollectiveId === transaction.HostCollectiveId) {
+    return;
+  }
+
+  // Handle processor fees as separate transactions
+  let processorFeeTransaction;
+  const runInTransaction = async sqlTransaction => {
+    if (!transaction.paymentProcessorFeeInHostCurrency) {
+      processorFeeTransaction = await transaction.getPaymentProcessorFeeTransaction(null, { sqlTransaction });
+      if (!processorFeeTransaction) {
+        return;
+      }
+    }
+
+    const transactionCurrency = processorFeeTransaction?.currency || transaction.currency;
+    const hostCurrencyFxRate = await getFxRate(transactionCurrency, transaction.hostCurrency);
+    const originalProcessorFeeInHostCurrency = Math.abs(
+      processorFeeTransaction?.amountInHostCurrency || transaction.paymentProcessorFeeInHostCurrency || 0,
+    );
+    let amountInHostCurrency;
+    if (isNil(hostCoverInHostCurrency)) {
+      amountInHostCurrency = originalProcessorFeeInHostCurrency;
+    } else {
+      // Cover only for the difference between the original processor fee and the refunded amount
+      amountInHostCurrency = Math.abs(hostCoverInHostCurrency);
+    }
+
+    // Skip creating transaction if amount is zero
+    if (amountInHostCurrency === 0) {
+      return;
+    }
+
+    const amount = roundCentsAmount(amountInHostCurrency / hostCurrencyFxRate, transactionCurrency);
+    await Transaction.createDoubleEntry(
+      {
+        type: CREDIT,
+        kind: TransactionKind.PAYMENT_PROCESSOR_COVER,
+        CollectiveId: transaction.CollectiveId,
+        FromCollectiveId: transaction.HostCollectiveId,
+        HostCollectiveId: transaction.HostCollectiveId,
+        OrderId: transaction.OrderId,
+        ExpenseId: transaction.ExpenseId,
+        PaymentMethodId: transaction.PaymentMethodId,
+        description: 'Cover of payment processor fee for refund',
+        isRefund: true,
+        TransactionGroup: refundTransactionGroup,
+        hostCurrency: transaction.hostCurrency,
+        amountInHostCurrency,
+        currency: transactionCurrency,
+        amount,
+        netAmountInCollectiveCurrency: amount,
+        hostCurrencyFxRate,
+        platformFeeInHostCurrency: 0,
+        paymentProcessorFeeInHostCurrency: 0,
+        hostFeeInHostCurrency: 0,
+        data,
+        createdAt,
+        refundKind,
+      },
+      {
+        sequelizeTransaction: sqlTransaction,
+      },
+    );
+  };
+
+  return sqlTransaction ? runInTransaction(sqlTransaction) : sequelize.transaction(runInTransaction);
+};
+
+async function refundPaymentProcessorFee(
+  transaction: Transaction,
+  user: User | null,
+  refundedPaymentProcessorFeeInHostCurrency: number,
+  transactionGroup: string,
+  clearedAt?: Date,
+  refundKind?: RefundKind,
+  { sqlTransaction = undefined } = {},
+): Promise<void> {
+  const runInTransaction = async sqlTransaction => {
+    const isLegacyPaymentProcessorFee = Boolean(transaction.paymentProcessorFeeInHostCurrency);
+    let originalProcessorFeeInHostCurrency = transaction.paymentProcessorFeeInHostCurrency;
+
+    // Load processor fee transaction if using separate transactions
+    let processorFeeTransaction;
+    if (!transaction.paymentProcessorFeeInHostCurrency) {
+      processorFeeTransaction = await transaction.getPaymentProcessorFeeTransaction(null, { sqlTransaction });
+      if (!processorFeeTransaction) {
+        // If there is no processor fee on the original transaction and no separate processor fee transaction, there is nothing to refund
+        reportMessageToSentry('No processor fee found for refund with refundedPaymentProcessorFee set', {
+          severity: 'warning',
+          extra: {
+            refundedPaymentProcessorFee: refundedPaymentProcessorFeeInHostCurrency,
+            transaction: transaction.info,
+          },
+        });
+        return;
+      } else {
+        originalProcessorFeeInHostCurrency = processorFeeTransaction.amountInHostCurrency;
+      }
+    }
+
+    // Refund processor fees if the processor sent money back
+    if (refundedPaymentProcessorFeeInHostCurrency) {
+      // Check amount for partial refunds
+      if (Math.abs(refundedPaymentProcessorFeeInHostCurrency) > Math.abs(originalProcessorFeeInHostCurrency)) {
+        reportMessageToSentry('Refunded more payment processor fees than initially charged', {
+          severity: 'warning',
+          extra: {
+            refundedPaymentProcessorFee: refundedPaymentProcessorFeeInHostCurrency,
+            transaction: transaction.info,
+          },
+        });
+      }
+
+      if (processorFeeTransaction) {
+        const processorFeeRefund = {
+          ...buildRefundForTransaction(
+            processorFeeTransaction,
+            user,
+            null,
+            {
+              refundedAmountInHostCurrency: refundedPaymentProcessorFeeInHostCurrency,
+            },
+            refundKind,
+          ),
+          TransactionGroup: transactionGroup,
+          clearedAt,
+        };
+
+        const processorFeeRefundTransaction = await Transaction.createDoubleEntry(processorFeeRefund, {
+          sequelizeTransaction: sqlTransaction,
+        });
+
+        await associateTransactionRefundId(
+          processorFeeTransaction,
+          processorFeeRefundTransaction,
+          sqlTransaction,
+          null,
+          refundKind,
+        );
+      }
+    }
+
+    if (
+      Math.abs(refundedPaymentProcessorFeeInHostCurrency) < Math.abs(originalProcessorFeeInHostCurrency) ||
+      isLegacyPaymentProcessorFee
+    ) {
+      // When refunding an Expense, we need to use the DEBIT transaction which is attached to the Collective and its Host.
+      const transactionToRefundPaymentProcessorFee = transaction.ExpenseId
+        ? await transaction.getRelatedTransaction({ type: DEBIT }, { sqlTransaction })
+        : transaction;
+
+      const feesPayer = transaction.data?.feesPayer || ExpenseFeesPayer.COLLECTIVE;
+      if (feesPayer === ExpenseFeesPayer.COLLECTIVE) {
+        // Host take at their charge the payment processor fee that is lost when refunding a transaction
+        await refundPaymentProcessorFeeToCollective(
+          transactionToRefundPaymentProcessorFee,
+          transactionGroup,
+          refundKind,
+          {
+            sqlTransaction,
+            hostCoverInHostCurrency: isLegacyPaymentProcessorFee
+              ? originalProcessorFeeInHostCurrency
+              : Math.abs(originalProcessorFeeInHostCurrency) - Math.abs(refundedPaymentProcessorFeeInHostCurrency),
+          },
+        );
+      }
+    }
+  };
+
+  return sqlTransaction ? runInTransaction(sqlTransaction) : sequelize.transaction(runInTransaction);
+}
+
+export async function refundHostFee(
+  transaction: Transaction,
+  user: User | null,
+  refundedPaymentProcessorFeeInHostCurrency: number,
+  transactionGroup: string,
+  clearedAt?: Date,
+  refundKind?: RefundKind,
+  { sqlTransaction = undefined } = {},
+): Promise<void> {
+  const runInTransaction = async sqlTransaction => {
+    const hostFeeTransaction = await transaction.getHostFeeTransaction({ type: CREDIT }, { sqlTransaction });
+    const buildRefund = transaction => {
+      return {
+        ...buildRefundForTransaction(
+          transaction,
+          user,
+          null,
+          { refundedPaymentProcessorFeeInHostCurrency },
+          refundKind,
+        ),
+        TransactionGroup: transactionGroup,
+        clearedAt,
+      };
+    };
+
+    if (hostFeeTransaction && hostFeeTransaction.id !== transaction.id) {
+      const hostFeeRefund = buildRefund(hostFeeTransaction);
+      const hostFeeRefundTransaction = await Transaction.createDoubleEntry(hostFeeRefund, {
+        sequelizeTransaction: sqlTransaction,
+      });
+      await associateTransactionRefundId(
+        hostFeeTransaction,
+        hostFeeRefundTransaction,
+        sqlTransaction,
+        null,
+        refundKind,
+      );
+
+      // Refund Host Fee Share
+      const hostFeeShareTransaction = await transaction.getHostFeeShareTransaction(null, { sqlTransaction });
+      if (hostFeeShareTransaction) {
+        const hostFeeShareRefund = buildRefund(hostFeeShareTransaction);
+        const hostFeeShareRefundTransaction = await Transaction.createDoubleEntry(hostFeeShareRefund, {
+          sequelizeTransaction: sqlTransaction,
+        });
+        await associateTransactionRefundId(
+          hostFeeShareTransaction,
+          hostFeeShareRefundTransaction,
+          sqlTransaction,
+          null,
+          refundKind,
+        );
+
+        // Refund Host Fee Share Debt
+        const hostFeeShareDebtTransaction = await transaction.getHostFeeShareDebtTransaction(null, { sqlTransaction });
+        if (hostFeeShareDebtTransaction) {
+          const hostFeeShareSettlement = await TransactionSettlement.findOne({
+            transaction: sqlTransaction,
+            where: {
+              TransactionGroup: transaction.TransactionGroup,
+              kind: TransactionKind.HOST_FEE_SHARE_DEBT,
+            },
+          });
+          let hostFeeShareRefundSettlementStatus = TransactionSettlementStatus.OWED;
+          if (hostFeeShareSettlement.status === TransactionSettlementStatus.OWED) {
+            // If the Host Fee Share is not INVOICED or SETTLED, we don't need to care about recording it.
+            // Otherwise, the Host Fee Share refund will be marked as OWED and deduced from the next invoice
+            await hostFeeShareSettlement.update(
+              { status: TransactionSettlementStatus.SETTLED },
+              { transaction: sqlTransaction },
+            );
+            hostFeeShareRefundSettlementStatus = TransactionSettlementStatus.SETTLED;
+          }
+
+          const hostFeeShareDebtRefund = buildRefund(hostFeeShareDebtTransaction);
+          const hostFeeShareDebtRefundTransaction = await Transaction.createDoubleEntry(hostFeeShareDebtRefund, {
+            sequelizeTransaction: sqlTransaction,
+          });
+          await associateTransactionRefundId(
+            hostFeeShareDebtTransaction,
+            hostFeeShareDebtRefundTransaction,
+            sqlTransaction,
+            null,
+            refundKind,
+          );
+          await TransactionSettlement.createForTransaction(
+            hostFeeShareDebtRefundTransaction,
+            hostFeeShareRefundSettlementStatus,
+            sqlTransaction,
+          );
+        }
+      }
+    }
+  };
+
+  return sqlTransaction ? runInTransaction(sqlTransaction) : sequelize.transaction(runInTransaction);
+}
+
+async function refundTax(
+  transaction: Transaction,
+  user: User | null,
+  transactionGroup: string,
+  clearedAt?: Date,
+  refundKind?: RefundKind,
+  { sqlTransaction = undefined }: { sqlTransaction?: SequelizeTransaction } = {},
+): Promise<void> {
+  const runInTransaction = async sqlTransaction => {
+    const taxTransaction = await transaction.getTaxTransaction(null, { sqlTransaction });
+    if (taxTransaction) {
+      const taxRefundData = {
+        ...buildRefundForTransaction(taxTransaction, user, null, null, refundKind),
+        TransactionGroup: transactionGroup,
+        clearedAt,
+      };
+      const taxRefundTransaction = await Transaction.createDoubleEntry(taxRefundData, {
+        sequelizeTransaction: sqlTransaction,
+      });
+      await associateTransactionRefundId(taxTransaction, taxRefundTransaction, sqlTransaction, null, refundKind);
+    }
+  };
+
+  return sqlTransaction ? runInTransaction(sqlTransaction) : sequelize.transaction(runInTransaction);
+}
+
+/** Create refund transactions
+ *
+ * This function creates the negative transactions after refunding an
+ * existing transaction.
+ *
+ * If a CREDIT transaction from collective A to collective B is
+ * received. Two new transactions are created:
+ *
+ *   1. CREDIT from collective B to collective A
+ *   2. DEBIT from collective A to collective B
+ *
+ * @param {Transaction} transaction Can be either a
+ *  DEBIT or a CREDIT transaction and it will generate a pair of
+ *  transactions that debit the collective that was credited and
+ *  credit the user that was debited.
+ * @param {number} refundedPaymentProcessorFeeInHostCurrency is the amount refunded
+ *  by the payment processor. If it's 0 (zero) it means that the
+ *  payment processor didn't refund its fee at all. In that case, the
+ *  equivalent value will be moved from the host so the user can get
+ *  the full refund.
+ * @param {Object} data contains the information from the payment
+ *  method that should be saved within the *data* field of the
+ *  transactions being created.
+ */
+export async function createRefundTransaction(
+  transaction: Transaction,
+  refundedPaymentProcessorFeeInHostCurrency: number,
+  data: TransactionData,
+  user: User | null,
+  transactionGroupId?: string,
+  clearedAt?: Date,
+  refundKind: RefundKind = RefundKind.REFUND,
+  { sqlTransaction = undefined }: { sqlTransaction?: SequelizeTransaction } = {},
+): Promise<Transaction> {
+  const runInTransaction = async sqlTransaction => {
+    /* If the transaction passed isn't the one from the collective
+     * perspective, the opposite transaction is retrieved.
+     *
+     * However when the transaction is between the same collective (say an
+     * an expense from a collective to itself), then there will be no CREDIT
+     * transaction, and therefore we skip.
+     *
+     * */
+    if (transaction.type === DEBIT && transaction.FromCollectiveId !== transaction.CollectiveId) {
+      transaction = await transaction.getRelatedTransaction({ type: CREDIT }, { sqlTransaction });
+    }
+
+    if (!transaction) {
+      throw new Error('Cannot find any CREDIT transaction to refund');
+    } else if (transaction.RefundTransactionId) {
+      throw new Error('This transaction has already been refunded');
+    }
+
+    const transactionGroup = transactionGroupId || uuid();
+    const buildRefund = transaction => {
+      return {
+        ...buildRefundForTransaction(
+          transaction,
+          user,
+          data,
+          { refundedPaymentProcessorFeeInHostCurrency },
+          refundKind,
+        ),
+        clearedAt: clearedAt,
+        TransactionGroup: transactionGroup,
+      };
+    };
+
+    // Refund Platform Tip
+    const platformTipTransaction = await transaction.getPlatformTipTransaction({ type: CREDIT }, { sqlTransaction });
+    if (platformTipTransaction && platformTipTransaction.id !== transaction.id) {
+      const platformTipRefund = buildRefund(platformTipTransaction);
+      const platformTipRefundTransaction = await Transaction.createDoubleEntry(platformTipRefund, {
+        sequelizeTransaction: sqlTransaction,
+      });
+      await associateTransactionRefundId(
+        platformTipTransaction,
+        platformTipRefundTransaction,
+        sqlTransaction,
+        data,
+        refundKind,
+      );
+
+      // Refund Platform Tip Debt
+      // Tips directly collected (and legacy ones) do not have a "debt" transaction associated
+      const platformTipDebtTransaction = await transaction.getPlatformTipDebtTransaction(null, { sqlTransaction });
+      if (platformTipDebtTransaction && platformTipDebtTransaction.id !== transaction.id) {
+        // Update tip settlement status
+        const tipSettlement = await TransactionSettlement.findOne({
+          transaction: sqlTransaction,
+          where: {
+            TransactionGroup: transaction.TransactionGroup,
+            kind: TransactionKind.PLATFORM_TIP_DEBT,
+          },
+        });
+        let tipRefundSettlementStatus = TransactionSettlementStatus.OWED;
+        if (tipSettlement.status === TransactionSettlementStatus.OWED) {
+          // If the tip is not INVOICED or SETTLED, we don't need to care about recording it.
+          // Otherwise, the tip refund will be marked as OWED and deduced from the next invoice
+          await tipSettlement.update({ status: TransactionSettlementStatus.SETTLED }, { transaction: sqlTransaction });
+          tipRefundSettlementStatus = TransactionSettlementStatus.SETTLED;
+        }
+
+        const platformTipDebtRefund = buildRefund(platformTipDebtTransaction);
+        const platformTipDebtRefundTransaction = await Transaction.createDoubleEntry(platformTipDebtRefund, {
+          sequelizeTransaction: sqlTransaction,
+        });
+        await associateTransactionRefundId(
+          platformTipDebtTransaction,
+          platformTipDebtRefundTransaction,
+          sqlTransaction,
+          data,
+          refundKind,
+        );
+        await TransactionSettlement.createForTransaction(
+          platformTipDebtRefundTransaction,
+          tipRefundSettlementStatus,
+          sqlTransaction,
+        );
+      }
+    }
+
+    // Refund Payment Processor Fee
+    await refundPaymentProcessorFee(
+      transaction,
+      user,
+      refundedPaymentProcessorFeeInHostCurrency,
+      transactionGroup,
+      clearedAt,
+      refundKind,
+      { sqlTransaction },
+    );
+
+    // Refund Host Fee
+    await refundHostFee(
+      transaction,
+      user,
+      refundedPaymentProcessorFeeInHostCurrency,
+      transactionGroup,
+      clearedAt,
+      refundKind,
+      { sqlTransaction },
+    );
+
+    // Refund Tax
+    await refundTax(transaction, user, transactionGroup, clearedAt, refundKind, { sqlTransaction });
+
+    // Refund main transaction
+    const creditTransactionRefund = buildRefund(transaction);
+    const refundTransaction = await Transaction.createDoubleEntry(creditTransactionRefund, {
+      sequelizeTransaction: sqlTransaction,
+    });
+    await syncPaymentIntentFromRefund(refundTransaction, sqlTransaction);
+    return associateTransactionRefundId(transaction, refundTransaction, sqlTransaction, data, refundKind);
+  };
+
+  return sqlTransaction ? runInTransaction(sqlTransaction) : sequelize.transaction(runInTransaction);
+}
+
+export async function associateTransactionRefundId(
+  transaction: Transaction,
+  refund: Transaction,
+  sqlTransaction: SequelizeTransaction,
+  data?: TransactionData,
+  refundKind?: RefundKind,
+): Promise<Transaction> {
+  const transactions = await Transaction.findAll({
+    order: ['id'],
+    transaction: sqlTransaction,
+    where: {
+      [Op.or]: [
+        { TransactionGroup: transaction.TransactionGroup, kind: transaction.kind },
+        { TransactionGroup: refund.TransactionGroup, kind: refund.kind },
+      ],
+    },
+  });
+
+  const credit = transactions.find(t => !t.isRefund && t.type === CREDIT);
+  const debit = transactions.find(t => !t.isRefund && t.type === DEBIT);
+  const refundCredit = transactions.find(t => t.isRefund && t.type === CREDIT);
+  const refundDebit = transactions.find(t => t.isRefund && t.type === DEBIT);
+
+  // After refunding a transaction, in some cases the data may be updated as well (stripe data changes after refunds)
+  if (data && Object.keys(data).length) {
+    debit.data = data;
+    credit.data = data;
+  }
+
+  if (refundCredit && debit) {
+    debit.RefundTransactionId = refundCredit.id;
+    debit.refundKind = refundKind;
+    await debit.save({ transaction: sqlTransaction }); // User Ledger
+    refundCredit.RefundTransactionId = debit.id;
+    refundCredit.refundKind = refundKind;
+    await refundCredit.save({ transaction: sqlTransaction }); // User Ledger
+  }
+
+  if (refundDebit && credit) {
+    credit.RefundTransactionId = refundDebit.id;
+    credit.refundKind = refundKind;
+    await credit.save({ transaction: sqlTransaction }); // Collective Ledger
+    refundDebit.RefundTransactionId = credit.id;
+    refundDebit.refundKind = refundKind;
+    await refundDebit.save({ transaction: sqlTransaction }); // Collective Ledger
+  }
+
+  // We need to return the same transactions we received because the
+  // graphql mutation needs it to return to the user. However we have
+  // to return the updated instances, not the ones we received.
+  return find([refundCredit, refundDebit, debit, credit], { id: transaction.id });
+}
+
+/*
+ * Send email notifications.
+ *
+ * Don't send emails when moving funds between a sub-collective(event/project) and its parent or
+ * from between a host and one of its collectives.
+ *
+ * In all cases, transaction.type is CREDIT.
+ *
+ */
+
+export const sendEmailNotifications = (
+  order: Order,
+  transaction?: Transaction | void,
+  { firstPayment }: { firstPayment?: boolean } = { firstPayment: true },
+): void => {
+  debug('sendEmailNotifications');
+  if (
+    transaction &&
+    // Check if transaction is from child (event/project) to parent (collective/fund/host).
+    // fromCollective: child (event/project), collective: parent (collective/fund/host)
+    order.fromCollective?.ParentCollectiveId !== order.collective?.id &&
+    // Check if transaction is from parent (collective/fund/host) to child (event/project)
+    // fromCollective: parent (collective/fund/host) , collective: child (event/project)
+    order.fromCollective?.id !== order.collective?.ParentCollectiveId &&
+    // Check if transaction is from host to one of its hosted collective/fund/project/event
+    // fromCollective: host, collective: a collective/fund/project/event
+    order.fromCollective?.id !== order.collective?.HostCollectiveId &&
+    // Check if transaction is from a collective/fund/project/event to its host
+    // fromCollective: a collective/fund/project/event, collective: host of fromCollective
+    order.fromCollective?.HostCollectiveId !== order.collective?.id &&
+    // Check if transaction is from a collective to itself. This happens when we add funds
+    // choosing the source as itself. In this case do not send an email.
+    order.fromCollective?.id !== order.collective?.id
+  ) {
+    recordOrderConfirmation(order, transaction, { firstPayment }); // async
+  } else if (order.status === OrderStatuses.PENDING) {
+    sendOrderPendingEmail(order); // This is the one for the Contributor
+    sendManualPendingOrderEmail(order); // This is the one for the Host Admins
+  } else if (order.status === OrderStatuses.PROCESSING) {
+    sendOrderProcessingEmail(order);
+  }
+};
+
+export const createSubscription = async (order: Order, data?: { lastChargedAt?: Date }): Promise<void> => {
+  const subscription = await Subscription.create({
+    amount: order.totalAmount,
+    interval: order.interval,
+    currency: order.currency,
+    lastChargedAt: data?.lastChargedAt,
+  });
+  // The order instance doesn't have the Subscription field
+  // here because it was just created and no models were
+  // included so we're doing that manually here. Not the
+  // cutest but works.
+  order.Subscription = subscription;
+  const updatedDates = getNextChargeAndPeriodStartDates('new', order);
+  order.Subscription.nextChargeDate = updatedDates.nextChargeDate;
+  order.Subscription.nextPeriodStart = updatedDates.nextPeriodStart || order.Subscription.nextPeriodStart;
+
+  // Both subscriptions and one time donations are charged
+  // immediately and there won't be a better time to update
+  // this field after this.
+  order.Subscription.chargeNumber = 1;
+  order.Subscription.activate();
+  await order.update({
+    status: OrderStatuses.ACTIVE,
+    SubscriptionId: order.Subscription.id,
+  });
+
+  // Mark any paused orders for this fromCollective/collective as cancelled
+  await order.markSimilarPausedOrdersAsCancelled();
+};
+
+/**
+ * Execute an order as user using paymentMethod
+ * Note: validation of the paymentMethod happens in `Order.setPaymentMethod`. Not here anymore.
+ * @param {Object} order { tier, description, totalAmount, currency, interval (null|month|year), paymentMethod }
+ * @param {Object} options { hostFeePercent, platformFeePercent} (only for add funds and if remoteUser is admin of host or root)
+ */
+export const executeOrder = async (
+  user: User,
+  order: Order,
+  options: { isAddedFund?: boolean; invoiceTemplate?: string } = {},
+): Promise<void> => {
+  if (!(user instanceof User)) {
+    return Promise.reject(new Error('user should be an instance of the User model'));
+  }
+  if (!order) {
+    return Promise.reject(new Error('No order provided'));
+  }
+  if (!(order instanceof Order)) {
+    return Promise.reject(new Error('order should be an instance of the Order model'));
+  }
+
+  /* Added funds have a processedAt date by default because they are processed
+     immediately. If the payment method is manual the host admin will have to
+     process it manually and potentially can set a date using the confirm
+     contribution modal. */
+  if (order.processedAt && !options.isAddedFund && order.paymentMethod.type !== 'manual') {
+    return Promise.reject(new Error(`This order (#${order.id}) has already been processed at ${order.processedAt}`));
+  }
+  debug('executeOrder', user.email, order.description, order.totalAmount, options);
+
+  const payment = {
+    amount: order.totalAmount,
+    interval: order.interval,
+    currency: order.currency,
+  };
+
+  try {
+    validatePayment(payment);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+
+  await order.populate();
+
+  const transaction = await processOrder(order, options);
+  if (transaction) {
+    await order.update({
+      status: OrderStatuses.PAID,
+      processedAt: order.processedAt || new Date(),
+      data: omit(order.data, ['stripePaymentIntent']),
+    });
+
+    await applyContributionAccountingCategoryRules(order);
+
+    // Credit card charges are synchronous. If the transaction is
+    // created here it means that the payment went through so it's
+    // safe to create subscription after this.
+
+    // The order will be updated to ACTIVE
+    if (order.interval) {
+      await createSubscription(order, { lastChargedAt: order.processedAt });
+    }
+
+    // Register user as collective backer (don't do for internal transfers)
+    // Or in the case of tickets register the user as an ATTENDEE
+    if (order.fromCollective?.ParentCollectiveId !== order.collective.id) {
+      await order.getOrCreateMembers();
+    }
+
+    // Create a Pre-Paid Payment Method for the prepaid budget
+    if (isPrepaidBudgetOrder(order)) {
+      await createPrepaidPaymentMethod(transaction);
+    }
+  }
+
+  // If the user asked for it, mark the payment method as saved for future financial contributions
+  if (order.data && order.data.savePaymentMethod) {
+    order.paymentMethod.saved = true;
+    order.paymentMethod.save();
+  }
+
+  sendEmailNotifications(order, transaction, {
+    firstPayment: true,
+  });
+
+  // Register gift card emitter as collective backer too
+  if (transaction && transaction.UsingGiftCardFromCollectiveId) {
+    await order.collective.findOrAddUserWithRole(
+      { id: user.id, CollectiveId: transaction.UsingGiftCardFromCollectiveId },
+      roles.BACKER,
+      { TierId: get(order, 'tier.id') },
+      { order, skipActivity: true },
+    );
+  }
+};
+
+const validatePayment = (payment): void => {
+  if (payment.interval && !includes(['month', 'year'], payment.interval)) {
+    throw new Error('Interval should be null, month or year.');
+  }
+
+  if (!payment.amount) {
+    throw new Error('payment.amount missing');
+  }
+};
+
+const recordOrderConfirmation = async (
+  order: Order,
+  transaction: Transaction,
+  { firstPayment }: { firstPayment?: boolean } = {},
+): Promise<void> => {
+  const attachments = [];
+  const { collective, interval, fromCollective, paymentMethod } = order;
+  const user = await order.getUserForActivity();
+  const host = await collective.getHostCollective();
+  const parentCollective = await collective.getParentCollective();
+  const customMessage = collective.settings?.customEmailMessage || parentCollective?.settings?.customEmailMessage;
+
+  if (!order.tier && order.TierId) {
+    order.tier = await order.getTier();
+  }
+
+  if (order.tier?.type === tiers.TICKET) {
+    await Activity.create({
+      type: activities.TICKET_CONFIRMED,
+      CollectiveId: collective.id,
+      FromCollectiveId: fromCollective.id,
+      OrderId: order.id,
+      HostCollectiveId: host?.id,
+      UserId: user.id,
+      data: {
+        EventCollectiveId: collective.id,
+        UserId: user.id,
+        recipient: { name: fromCollective.name },
+        order: order.info,
+        tier: order.tier.info,
+        host: host ? host.info : {},
+        customMessage,
+      },
+    });
+  } else {
+    // normal order
+    const data = {
+      order: order.info,
+      transaction: transaction ? transaction.info : { createdAt: new Date() },
+      user: user.info,
+      collective: collective.info,
+      host: host ? host.info : {},
+      fromCollective: fromCollective.minimal,
+      interval,
+      monthlyInterval: interval === 'month',
+      firstPayment,
+      subscriptionsLink: interval && getEditRecurringContributionsUrl(fromCollective),
+      customMessage,
+      transactionPdf: false,
+      platformTipPdf: false,
+      // Include Pending Order contact info if available
+      fromAccountInfo: order.data?.fromAccountInfo,
+    };
+
+    // hit PDF service and get PDF (unless payment method type is gift card)
+    if (paymentMethod?.type !== PAYMENT_METHOD_TYPE.GIFTCARD) {
+      const transactionPdf = await getTransactionPdf(transaction, user);
+      if (transactionPdf) {
+        const createdAtString = toIsoDateStr(transaction.createdAt ? new Date(transaction.createdAt) : new Date());
+        attachments.push({
+          filename: `transaction_${collective.slug}_${createdAtString}_${transaction.uuid}.pdf`,
+          content: transactionPdf,
+        });
+        data.transactionPdf = true;
+      }
+
+      if (transaction.hasPlatformTip()) {
+        const platformTipTransaction = await transaction.getPlatformTipTransaction();
+        if (platformTipTransaction) {
+          const platformTipPdf = await getTransactionPdf(platformTipTransaction, user);
+          if (platformTipPdf) {
+            const createdAtString = toIsoDateStr(new Date(platformTipTransaction.createdAt));
+            attachments.push({
+              filename: `transaction_opencollective_${createdAtString}_${platformTipTransaction.uuid}.pdf`,
+              content: platformTipPdf,
+            });
+            data.platformTipPdf = true;
+          }
+        }
+      }
+    }
+
+    const activity = await order.createProcessedActivity({ user, data });
+    await notify.collective(activity, {
+      collectiveId: data.fromCollective.id,
+      role: [roles.ACCOUNTANT, roles.ADMIN],
+      from: emailLib.generateFromEmailHeader(collective.name),
+      attachments,
+    });
+  }
+};
+
+// Assumes one-time payments,
+export const sendOrderPendingEmail = async (order: Order): Promise<void> => {
+  const { collective, fromCollective } = order;
+  const user = order.createdByUser;
+  const host = await collective.getHostCollective();
+
+  // Use manual payment provider if available, otherwise fall back to legacy manual bank transfer
+  let providerAccount;
+  let providerInstructions;
+  let providerName;
+
+  const manualPaymentProvider =
+    order.ManualPaymentProviderId && (await ManualPaymentProvider.findByPk(order.ManualPaymentProviderId));
+  if (!manualPaymentProvider) {
+    throw new Error(`Manual payment provider not found for order ${order.id}`);
+  } else {
+    providerInstructions = manualPaymentProvider.instructions || null;
+    providerName = manualPaymentProvider.name || null;
+    providerAccount =
+      manualPaymentProvider.type === ManualPaymentProviderTypes.BANK_TRANSFER
+        ? formatAccountDetails(manualPaymentProvider.data?.accountDetails, { asSafeHTML: true })
+        : '';
+  }
+
+  const data = {
+    account: providerAccount,
+    order: order.info,
+    user: user.info,
+    collective: collective.info,
+    host: host.info,
+    fromCollective: fromCollective.activity,
+    subscriptionsLink: getEditRecurringContributionsUrl(fromCollective),
+    instructions: null,
+    paymentMethodName: providerName,
+  };
+
+  if (providerInstructions) {
+    const formatValues = {
+      account: providerAccount,
+      reference: order.id,
+      amount: formatCurrency(order.totalAmount, order.currency, 2),
+      collective: order.collective.name,
+      // @deprecated but we still have some entries in the DB
+      OrderId: order.id,
+    };
+    data.instructions = sanitizeManualPaymentProviderInstructions(
+      providerInstructions.replace(/{([\s\S]+?)}/g, (match, key) => {
+        if (key === 'account') {
+          return sanitizeHTML(formatValues.account, optsSanitizeOnlyTextFormatting);
+        } else if (key && !isNil(formatValues[key])) {
+          return escape(formatValues[key] || '');
+        } else {
+          return match;
+        }
+      }),
+    );
+  }
+  await Activity.create({
+    type: activities.ORDER_PENDING,
+    UserId: user.id,
+    CollectiveId: collective.id,
+    FromCollectiveId: fromCollective.id,
+    OrderId: order.id,
+    HostCollectiveId: host.id,
+    data,
+  });
+};
+
+export async function getOrderPaymentProcessingUrl(order: Order): Promise<string | null> {
+  const pm = order.paymentMethod || (await order.getPaymentMethod());
+  if (pm?.service === PAYMENT_METHOD_SERVICE.STRIPE) {
+    const stripePaymentIntentId = get(order, 'data.stripePaymentIntent.id');
+    if (!stripePaymentIntentId) {
+      return null;
+    }
+
+    const stripeAccountId = pm.data?.stripeAccount;
+
+    return getDashboardObjectIdURL(stripePaymentIntentId, stripeAccountId);
+  }
+  return null;
+}
+
+const sendOrderProcessingEmail = async (order: Order): Promise<void> => {
+  const { collective, fromCollective } = order;
+  const user = order.createdByUser;
+  const host = await collective.getHostCollective();
+
+  const data = {
+    order: order.info,
+    user: user.info,
+    collective: collective.info,
+    host: host.info,
+    fromCollective: fromCollective.activity,
+    paymentProcessorUrl: await getOrderPaymentProcessingUrl(order),
+  };
+
+  await Activity.create({
+    type: activities.ORDER_PROCESSING,
+    UserId: user.id,
+    CollectiveId: collective.id,
+    FromCollectiveId: fromCollective.id,
+    OrderId: order.id,
+    HostCollectiveId: host.id,
+    data,
+  });
+};
+
+export const sendOrderFailedEmail = async (order: Order, reason: string): Promise<void> => {
+  const user = order.createdByUser;
+  const { collective, fromCollective } = order;
+  const host = await collective.getHostCollective();
+
+  const data = {
+    order: order.info,
+    user: user.info,
+    collective: collective.info,
+    host: host.info,
+    fromCollective: fromCollective.activity,
+    reason,
+    paymentProcessorUrl: await getOrderPaymentProcessingUrl(order),
+  };
+
+  await Activity.create({
+    type: activities.ORDER_PAYMENT_FAILED,
+    UserId: user.id,
+    CollectiveId: collective.id,
+    FromCollectiveId: fromCollective.id,
+    OrderId: order.id,
+    HostCollectiveId: host.id,
+    data,
+  });
+};
+
+const sendManualPendingOrderEmail = async (order: Order): Promise<void> => {
+  const { collective, fromCollective } = order;
+  const host = await collective.getHostCollective();
+
+  let replyTo: string | string[] = [];
+  if (fromCollective.isIncognito) {
+    // We still want to surface incognito emails to the host as they often need to contact them to reconciliate the bank transfer
+    const user = await User.findByPk(fromCollective.CreatedByUserId);
+    if (user) {
+      replyTo.push(user.email);
+    }
+  } else {
+    const fromCollectiveAdmins = await fromCollective.getAdminUsers();
+    replyTo = fromCollectiveAdmins.map(({ email }) => email).join(', ');
+  }
+
+  const data = {
+    order: order.info,
+    collective: collective.info,
+    host: host.info,
+    fromCollective: fromCollective.activity,
+    pendingOrderLink: `${config.host.website}/dashboard/${host.slug}/incomplete-contributions?orderId=${order.id}`,
+    replyTo,
+    isSystem: true,
+  };
+  await Activity.create({
+    type: activities.ORDER_PENDING_CONTRIBUTION_NEW,
+    CollectiveId: order.CollectiveId,
+    FromCollectiveId: order.FromCollectiveId,
+    HostCollectiveId: collective.approvedAt ? collective.HostCollectiveId : null,
+    OrderId: order.id,
+    UserId: order.CreatedByUserId,
+    data,
+  });
+};
+
+export const sendReminderPendingOrderEmail = async (order: Order): Promise<void> => {
+  const { collective, fromCollective } = order;
+  const host = await collective.getHostCollective();
+
+  // It could be that pending orders are from pledged collective and don't have an host
+  // In this case, we should skip it
+  // TODO: we should be able to more precisely query orders and exclude these
+  if (!host) {
+    return;
+  }
+
+  const data = {
+    order: order.info,
+    collective: collective.info,
+    host: host.info,
+    fromCollective: fromCollective.activity,
+    viewDetailsLink: `${config.host.website}/dashboard/${host.slug}/incomplete-contributions?orderId=${order.id}`,
+    isSystem: true,
+  };
+  await Activity.create({
+    type: activities.ORDER_PENDING_CONTRIBUTION_REMINDER,
+    CollectiveId: order.CollectiveId,
+    FromCollectiveId: order.FromCollectiveId,
+    HostCollectiveId: collective.approvedAt ? collective.HostCollectiveId : null,
+    OrderId: order.id,
+    data,
+  });
+};
+
+export const sendExpiringCreditCardUpdateEmail = async (data): Promise<void> => {
+  data = {
+    ...data,
+    updateDetailsLink: `${config.host.website}/paymentmethod/${data.id}/update`,
+    isSystem: true,
+  };
+  await Activity.create({
+    type: activities.PAYMENT_CREDITCARD_EXPIRING,
+    CollectiveId: data.CollectiveId,
+    data,
+  });
+};
+
+export const getApplicationFee = async (order: Order): Promise<number> => {
+  let applicationFee = 0;
+
+  if (order.platformTipAmount) {
+    applicationFee += order.platformTipAmount;
+  }
+
+  const hostFeeAmount = await getHostFee(order);
+  const hostFeeSharePercent = await getHostFeeSharePercent(order);
+  if (hostFeeAmount && hostFeeSharePercent) {
+    const hostFeeShareAmount = calcFee(hostFeeAmount, hostFeeSharePercent, order.currency);
+    applicationFee += hostFeeShareAmount;
+  }
+
+  return applicationFee;
+};
+
+export const getPlatformTip = (order: Order): number => {
+  if (!isNil(order.platformTipAmount)) {
+    return order.platformTipAmount;
+  }
+  // Legacy form, but still being used sometime (to be verified and removed)
+  if (!isNil(order.data?.platformTip)) {
+    return order.data?.platformTip;
+  }
+  return 0;
+};
+
+export const getHostFee = async (order: Order): Promise<number> => {
+  const totalAmount = order.totalAmount || 0;
+  const taxAmount = order.taxAmount || 0;
+  const platformTipAmount = order.platformTipAmount || 0;
+
+  const hostFeePercent = await getHostFeePercent(order);
+
+  return calcFee(totalAmount - taxAmount - platformTipAmount, hostFeePercent, order.currency);
+};
+
+export const isPlatformTipEligible = async (order: Order): Promise<boolean> => {
+  if (!isNil(order.platformTipEligible)) {
+    return order.platformTipEligible;
+  }
+
+  // Make sure payment method is available
+  if (!order.paymentMethod && order.PaymentMethodId) {
+    order.paymentMethod = await order.getPaymentMethod();
+  }
+
+  // Added Funds are not eligible to Platform Tips
+  if (
+    order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE &&
+    order.paymentMethod?.type === PAYMENT_METHOD_TYPE.HOST
+  ) {
+    return false;
+  }
+
+  if (!order.collective) {
+    order.collective = await order.getCollective();
+  }
+
+  return order.collective.hasPlatformTips();
+};
+
+export const getHostFeePercent = async (
+  order: Order,
+  { loaders = null }: { loaders?: loaders } = {},
+): Promise<number | null> => {
+  const collective =
+    order.collective || (await loaders?.Collective.byId.load(order.CollectiveId)) || (await order.getCollective());
+
+  if (!collective) {
+    return null;
+  }
+
+  const host = await collective.getHostCollective({ loaders });
+  const parent = await collective.getParentCollective({ loaders });
+
+  // Make sure payment method is available
+  if (!order.paymentMethod && order.PaymentMethodId) {
+    order.paymentMethod = await order.getPaymentMethod();
+  }
+
+  // No Host Fee for money going to an host itself
+  if (collective.hasMoneyManagement) {
+    return 0;
+  }
+
+  const possibleValues = [
+    // Fixed in the Order (Added Funds or special tiers: Pre-Paid)
+    order.data?.hostFeePercent,
+  ];
+
+  if (
+    order.data?.isPendingContribution === true ||
+    order.data?.isManualContribution === true ||
+    (order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE &&
+      order.paymentMethod?.type === PAYMENT_METHOD_TYPE.MANUAL)
+  ) {
+    // Fixed for Bank Transfers at collective level
+    // As of December 2023, this will be only set on a selection of OCF Collectives
+    // 1kproject 6%, mealsofgratitude 5%, modulo 5%
+    // parentpreneur-foundation 5%, juneteenth-conference 6%
+    possibleValues.push(collective.data?.bankTransfersHostFeePercent);
+    // Fixed for Bank Transfers at parent level
+    possibleValues.push(parent?.data?.bankTransfersHostFeePercent);
+
+    // Custom fee is a priority over host custom one
+    if (collective.data?.useCustomHostFee) {
+      possibleValues.push(collective.hostFeePercent);
+    }
+    if (parent?.data?.useCustomHostFee) {
+      possibleValues.push(parent?.hostFeePercent);
+    }
+
+    // Fixed for Bank Transfers at host level
+    // As of December 2023, this is only set on a selection of Hosts:
+    // foundation 8% (instead of 5%), europe 10% (instead of 8%)
+    possibleValues.push(host?.data?.bankTransfersHostFeePercent);
+  }
+
+  if (
+    order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE &&
+    order.paymentMethod?.type === PAYMENT_METHOD_TYPE.PREPAID
+  ) {
+    if (order.paymentMethod.data?.hostFeePercent) {
+      possibleValues.push(order.paymentMethod.data?.hostFeePercent);
+    }
+  }
+
+  if (
+    order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE &&
+    order.paymentMethod?.type === PAYMENT_METHOD_TYPE.HOST
+  ) {
+    // Fixed for Added Funds at collective level
+    possibleValues.push(collective.data?.addedFundsHostFeePercent);
+    // Fixed for Added Funds at parent level
+    possibleValues.push(parent?.data?.addedFundsHostFeePercent);
+
+    // Custom fee is a priority over host custom one
+    if (collective.data?.useCustomHostFee) {
+      possibleValues.push(collective.hostFeePercent);
+    }
+    if (parent?.data?.useCustomHostFee) {
+      possibleValues.push(parent?.hostFeePercent);
+    }
+
+    // Fixed for Added Funds at host level
+    possibleValues.push(host?.data?.addedFundsHostFeePercent);
+  }
+
+  if (
+    order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE &&
+    order.paymentMethod?.type === PAYMENT_METHOD_TYPE.COLLECTIVE
+  ) {
+    // Default to 0 for Collective to Collective on the same Host
+    possibleValues.push(0);
+  }
+
+  if (order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.STRIPE) {
+    // Configurable by the Host globally, at the Collective or Parent level
+    // possibleValues.push(collective.data?.stripeHostFeePercent); // not used in the wild so far
+    // possibleValues.push(parent?.data?.stripeHostFeePercent); // not used in the wild so far
+
+    // Custom fee is a priority over host custom one
+    if (collective.data?.useCustomHostFee) {
+      possibleValues.push(collective.hostFeePercent);
+    }
+    if (parent?.data?.useCustomHostFee) {
+      possibleValues.push(parent?.hostFeePercent);
+    }
+
+    // To help OSC transition to Platform Tips
+    if (order.platformTipEligible !== true) {
+      possibleValues.push(host?.data?.stripeNotPlatformTipEligibleHostFeePercent);
+    }
+
+    // possibleValues.push(host.data?.stripeHostFeePercent); // not used in the wild so far
+  }
+
+  if (order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.PAYPAL) {
+    // Configurable by the Host globally or at the Collective level
+    // possibleValues.push(collective.data?.paypalHostFeePercent); // not used in the wild so far
+    // possibleValues.push(parent?.data?.paypalHostFeePercent); // not used in the wild so far
+
+    // Custom fee is a priority over host custom one
+    if (collective.data?.useCustomHostFee) {
+      possibleValues.push(collective.hostFeePercent);
+    }
+    if (parent?.data?.useCustomHostFee) {
+      possibleValues.push(parent?.hostFeePercent);
+    }
+
+    // To help OSC transition to Platform Tips
+    if (order.platformTipEligible !== true) {
+      possibleValues.push(host?.data?.paypalNotPlatformTipEligibleHostFeePercent);
+    }
+
+    // possibleValues.push(host.data?.paypalHostFeePercent); // not used in the wild so far
+  }
+
+  // Default for Collective
+  possibleValues.push(collective.hostFeePercent);
+
+  // Just in case, default on the platform (not used in normal operation)
+  possibleValues.push(config.fees.default.hostPercent);
+
+  // Pick the first that is set as a Number
+  return possibleValues.find(isNumber);
+};
+
+export const getHostFeeSharePercent = async (
+  order: Order,
+  { loaders = null, sqlTransaction = undefined }: { loaders?: loaders; sqlTransaction?: SequelizeTransaction } = {},
+): Promise<number> => {
+  if (!order.collective) {
+    if (loaders && !sqlTransaction) {
+      order.collective = await loaders.Collective.byId.load(order.CollectiveId);
+    } else {
+      order.collective = await order.getCollective({ transaction: sqlTransaction });
+    }
+  }
+
+  const host = await order.collective.getHostCollective({ loaders, transaction: sqlTransaction });
+
+  const plan = host.getLegacyPlan();
+
+  const possibleValues = [];
+
+  // Platform Tip Eligible or Platform Fee? No Host Fee Share, that's it
+  if (order.platformTipEligible === true) {
+    return 0;
+  }
+
+  // Make sure payment method is available
+  if (!order.paymentMethod && order.PaymentMethodId) {
+    order.paymentMethod = await order.getPaymentMethod({ transaction: sqlTransaction });
+  }
+
+  // Used by 1st party hosts to set Stripe and PayPal (aka "Crowfunding") share percent to zero
+  // Ideally, this will not be used in the future as we'll always rely on the platformTipEligible flag to do that
+  // We still have a lot of old orders were platformTipEligible is not set, so we'll keep that configuration for now
+
+  // Assign different fees based on the payment provider
+  if (order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.STRIPE) {
+    possibleValues.push(host.data?.stripeHostFeeSharePercent);
+    possibleValues.push(plan?.stripeHostFeeSharePercent); // deprecated
+  } else if (order.paymentMethod?.service === PAYMENT_METHOD_SERVICE.PAYPAL) {
+    possibleValues.push(host.data?.paypalHostFeeSharePercent);
+    possibleValues.push(plan?.paypalHostFeeSharePercent); // deprecated
+  }
+
+  // Default
+  possibleValues.push(host.data?.hostFeeSharePercent);
+  possibleValues.push(plan?.hostFeeSharePercent);
+
+  // Pick the first that is set as a Number
+  return possibleValues.find(isNumber);
+};
+
+/** Account types that can only pay with balance-based methods (collective balance, gift card, prepaid). */
+export const BALANCE_ONLY_COLLECTIVE_TYPES = [CollectiveType.COLLECTIVE, CollectiveType.EVENT, CollectiveType.PROJECT];
+
+export const isBalanceOnlyCollectiveType = (type: CollectiveType | string): boolean =>
+  BALANCE_ONLY_COLLECTIVE_TYPES.includes(type as CollectiveType);

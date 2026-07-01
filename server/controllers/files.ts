@@ -1,0 +1,97 @@
+import config from 'config';
+import { Request, Response } from 'express';
+
+import { hasUploadedFilePermission } from '../graphql/common/uploaded-file';
+import { idDecode, IDENTIFIER_TYPES } from '../graphql/v2/identifiers';
+import { getSignedGetURL, parseS3Url } from '../lib/awsS3';
+import { EntityShortIdPrefix, isEntityPublicId } from '../lib/permalink/entity-map';
+import { Expense, UploadedFile } from '../models';
+
+/**
+ * GET /api/files/:uploadedFileId
+ *
+ * Query Params
+ *
+ * json - return json response
+ * thumbnail - return thumbnail json
+ */
+export async function getFile(req: Request, res: Response) {
+  res.set('Cache-Control', 'private');
+
+  const isJsonAccepted = req.query.json !== undefined;
+  const isThumbnail = req.query.thumbnail !== undefined;
+  const isDownload = req.query.download !== undefined;
+
+  const { uploadedFileId } = req.params;
+  const { expenseId, draftKey } = req.query;
+
+  let resolvedExpenseId: number | null = null;
+  if (expenseId && typeof expenseId !== 'string') {
+    return res.status(400).send({ message: 'Invalid id' });
+  } else if (isEntityPublicId(expenseId, EntityShortIdPrefix.Expense)) {
+    resolvedExpenseId = await Expense.findOne({ where: { publicId: expenseId } }).then(expense => expense?.id);
+  } else if (expenseId) {
+    resolvedExpenseId = idDecode(expenseId as string, IDENTIFIER_TYPES.EXPENSE);
+  }
+
+  if (draftKey && typeof draftKey !== 'string') {
+    return res.status(400).send({ message: 'Invalid id' });
+  }
+
+  let uploadedFile: UploadedFile;
+
+  if (isEntityPublicId(uploadedFileId, EntityShortIdPrefix.UploadedFile)) {
+    uploadedFile = await UploadedFile.findOne({ where: { publicId: uploadedFileId } });
+  } else {
+    try {
+      uploadedFile = await UploadedFile.findByPk(idDecode(uploadedFileId, IDENTIFIER_TYPES.UPLOADED_FILE));
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    } catch (err) {
+      return res.status(400).send({ message: 'Invalid id' });
+    }
+  }
+
+  if (!uploadedFile) {
+    return res.status(403).send({ message: 'Unauthorized' });
+  }
+
+  const actualUrl = uploadedFile.getDataValue('url');
+
+  if (
+    !(await hasUploadedFilePermission(req, uploadedFile, {
+      expenseId: resolvedExpenseId,
+      draftKey: draftKey as string,
+    }))
+  ) {
+    return res.status(403).send({ message: 'Unauthorized' });
+  }
+
+  let redirectUrl: string;
+
+  if (isThumbnail) {
+    if (uploadedFile.fileType === 'application/pdf') {
+      redirectUrl = `${config.host.website}/static/images/mime-pdf.png`;
+    } else {
+      redirectUrl = `${config.host.website}/static/images/file-text.svg`;
+    }
+  } else {
+    if (!UploadedFile.isOpenCollectiveS3BucketURL(actualUrl)) {
+      redirectUrl = actualUrl;
+    } else {
+      const { bucket, key } = parseS3Url(actualUrl);
+      const responseContentDisposition = isDownload
+        ? `attachment; filename="${encodeURIComponent(uploadedFile.fileName || 'file')}"`
+        : null;
+      redirectUrl = await getSignedGetURL(
+        { Bucket: bucket, Key: key, ResponseContentDisposition: responseContentDisposition },
+        { expiresIn: 3600 },
+      );
+    }
+  }
+
+  if (isJsonAccepted) {
+    return res.send({ url: redirectUrl });
+  } else {
+    return res.redirect(307, redirectUrl);
+  }
+}

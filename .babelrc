@@ -1,0 +1,26 @@
+{
+  "presets": [
+    [
+      "@babel/preset-env",
+      {
+        "targets": {
+          "node": true
+        }
+      }
+    ]
+  ],
+  "plugins": [
+    [
+      "@babel/plugin-transform-typescript",
+      {
+        "allowDeclareFields": true
+      }
+    ],
+    "add-module-exports",
+  ],
+  "env": {
+    "test": {
+      "plugins": ["istanbul"]
+    }
+  }
+}

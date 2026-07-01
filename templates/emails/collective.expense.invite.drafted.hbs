@@ -1,0 +1,65 @@
+Subject: {{#ifCond payee.type "===" "USER"}}{{{collective.name}}} wants to pay you{{else if isCrossHostExpense}}{{{collective.name}}} wants to send funds to one of your hosted collectives{{else}}{{{payee.name}}} wants to send funds to {{{collective.name}}}{{/ifCond}} on Open Collective
+
+{{> header}}
+
+<center>
+  <h1>
+    {{collective.name}} wants you to submit an expense
+  </h1>
+</center>
+<p>
+  {{#ifCond payee.type "===" "USER"}}  
+  {{> linkCollective collective=fromCollective}} is inviting you to get paid by {{> linkCollective collective=collective}} on Open Collective.
+  {{else if isCrossHostExpense}}
+  {{> linkCollective collective=collective}} wants to send funds to one of your hosted collectives, {{> linkCollective collective=payee}}, on Open Collective.
+  {{else}}
+  {{> linkCollective collective=fromCollective}} is inviting {{> linkCollective collective=payee}} to get paid by {{> linkCollective collective=collective}} on Open Collective.
+  {{/ifCond}}
+  You need to confirm some details before your payment can be processed.
+</p>
+
+
+<br />
+<br />
+
+<table>
+  <tr>
+    <th>Requested by </th>
+    <td>{{> linkCollective collective=fromCollective}}</td>
+  </tr>
+  {{#if recipientNote}}
+  <tr>
+    <th>Note: </th>
+    <td>{{recipientNote}}</td>
+  </tr>
+  {{/if}}
+  {{#if items}}
+  <tr>
+    <th colspan="2"><br />Details:</th>
+  </tr>
+  {{#each items}}
+  <tr>
+    <td>{{{description}}}</td>
+    <td>{{currency amount currency=@root.expense.currency}}</td>
+  </tr>
+  {{/each}}
+  {{/if}}
+</table>
+
+<br />
+<br />
+
+<div class="info">
+  Don't worry, you'll be able to edit the info before submitting the expense for payment.
+</div>
+
+<br />
+<br />
+
+<center>
+  <a href="{{inviteUrl}}" class="btn blue">
+    <div>OK, let's go!</div>
+  </a>
+</center>
+
+{{> footer}}

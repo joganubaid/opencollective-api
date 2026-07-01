@@ -1,0 +1,187 @@
+import { isNil } from 'lodash';
+import {
+  BelongsToGetAssociationMixin,
+  CreationOptional,
+  InferAttributes,
+  InferCreationAttributes,
+  NonAttribute,
+} from 'sequelize';
+
+import { supportedServices } from '../constants/connected-account';
+import { crypto } from '../lib/encryption';
+import { EntityShortIdPrefix } from '../lib/permalink/entity-map';
+import sequelize, { DataTypes } from '../lib/sequelize';
+
+import type Collective from './Collective';
+import { ModelWithPublicId } from './ModelWithPublicId';
+import PayoutMethod, { PayoutMethodTypes } from './PayoutMethod';
+import type User from './User';
+
+class ConnectedAccount extends ModelWithPublicId<
+  EntityShortIdPrefix.ConnectedAccount,
+  InferAttributes<ConnectedAccount, { omit: 'info' | 'activity' }>,
+  InferCreationAttributes<ConnectedAccount>
+> {
+  public static readonly nanoIdPrefix = EntityShortIdPrefix.ConnectedAccount;
+  public static readonly tableName = 'ConnectedAccounts' as const;
+
+  declare public readonly id: CreationOptional<number>;
+  declare public service: string;
+  declare public username: string;
+  declare public clientId: string;
+  declare public token: string;
+  declare public refreshToken: string;
+  declare public hash: string;
+  declare public data: CreationOptional<Record<string, any>>;
+  declare public settings: CreationOptional<Record<string, any>>;
+
+  declare public CollectiveId: CreationOptional<number>;
+  declare public CreatedByUserId: CreationOptional<number>;
+  declare public createdAt: CreationOptional<Date>;
+  declare public updatedAt: CreationOptional<Date>;
+  declare public deletedAt: CreationOptional<Date>;
+  declare public authorizationExpiresAt: CreationOptional<Date | null>;
+
+  declare public collective?: NonAttribute<Collective>;
+  declare public user?: NonAttribute<User>;
+  declare public getCollective: BelongsToGetAssociationMixin<Collective>;
+
+  get info() {
+    return {
+      id: this.id,
+      publicId: this.publicId,
+      service: this.service,
+      username: this.username,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+    };
+  }
+
+  get activity() {
+    return {
+      id: this.id,
+      publicId: this.publicId,
+      service: this.service,
+      CollectiveId: this.CollectiveId,
+      CreatedByUserId: this.CreatedByUserId,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+    };
+  }
+}
+
+ConnectedAccount.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    publicId: {
+      type: DataTypes.STRING,
+      unique: true,
+    },
+    service: {
+      type: DataTypes.STRING,
+      validate: {
+        isIn: {
+          args: [supportedServices],
+          msg: `Must be in ${supportedServices}`,
+        },
+      },
+    },
+    username: DataTypes.STRING, // paypal email / Stripe UserId username / ...
+    clientId: DataTypes.STRING, // paypal app id
+    // either paypal secret OR an accessToken to do requests to the provider on behalf of the user
+    token: {
+      type: DataTypes.STRING,
+      get() {
+        const encrypted = this.getDataValue('token');
+        return isNil(encrypted) ? null : crypto.decrypt(encrypted);
+      },
+      set(value: string) {
+        this.setDataValue('token', value ? crypto.encrypt(value) : null);
+      },
+    },
+    refreshToken: {
+      type: DataTypes.STRING,
+      get() {
+        const encrypted = this.getDataValue('refreshToken');
+        return isNil(encrypted) ? null : crypto.decrypt(encrypted);
+      },
+      set(value: string) {
+        this.setDataValue('refreshToken', value ? crypto.encrypt(value) : null);
+      },
+    },
+    data: DataTypes.JSONB, // Extra service provider specific data, e.g. Stripe: { publishableKey, scope, tokenType }
+    settings: DataTypes.JSONB, // configuration settings
+    createdAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+    },
+    deletedAt: {
+      type: DataTypes.DATE,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+    },
+    authorizationExpiresAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    hash: {
+      type: DataTypes.STRING,
+    },
+    CollectiveId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'Collectives',
+        key: 'id',
+      },
+    },
+    CreatedByUserId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'Users',
+        key: 'id',
+      },
+    },
+  },
+  {
+    sequelize,
+    paranoid: true,
+    hooks: {
+      async afterCreate(connectedAccount) {
+        if (connectedAccount.service === 'stripe') {
+          await PayoutMethod.create({
+            CollectiveId: connectedAccount.CollectiveId,
+            CreatedByUserId: connectedAccount.CreatedByUserId,
+            isSaved: true,
+            type: PayoutMethodTypes.STRIPE,
+            data: {
+              connectedAccountId: connectedAccount.id,
+              stripeAccountId: connectedAccount.username,
+              publishableKey: connectedAccount.data?.publishableKey,
+            },
+          });
+        }
+      },
+      async afterDestroy(connectedAccount) {
+        if (connectedAccount.service === 'stripe') {
+          await PayoutMethod.destroy({
+            where: {
+              type: PayoutMethodTypes.STRIPE,
+              CollectiveId: connectedAccount.CollectiveId,
+              data: {
+                connectedAccountId: connectedAccount.id,
+              },
+            },
+          });
+        }
+      },
+    },
+  },
+);
+
+export default ConnectedAccount;

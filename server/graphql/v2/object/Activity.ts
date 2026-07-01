@@ -1,0 +1,164 @@
+import type express from 'express';
+import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLDateTime, GraphQLJSON } from 'graphql-scalars';
+
+import { EntityShortIdPrefix, isEntityMigratedToPublicId } from '../../../lib/permalink/entity-map';
+import type { Collective, Conversation, Expense, Order, Transaction, Update } from '../../../models';
+import ActivityModel from '../../../models/Activity';
+import { sanitizeActivityData } from '../../common/activities';
+import { GraphQLActivityType } from '../enum';
+import { idEncode, IDENTIFIER_TYPES } from '../identifiers';
+import { GraphQLAccount } from '../interface/Account';
+import { GraphQLTransaction } from '../interface/Transaction';
+
+import GraphQLConversation from './Conversation';
+import { GraphQLExpense } from './Expense';
+import { GraphQLHost } from './Host';
+import { GraphQLIndividual } from './Individual';
+import { GraphQLOrder } from './Order';
+import GraphQLUpdate from './Update';
+
+export const GraphQLActivity = new GraphQLObjectType({
+  name: 'Activity',
+  description: 'An activity describing something that happened on the platform',
+  fields: () => ({
+    id: {
+      type: new GraphQLNonNull(GraphQLString),
+      description: 'Unique identifier for this activity',
+      resolve(activity: ActivityModel) {
+        if (isEntityMigratedToPublicId(EntityShortIdPrefix.Activity, activity.createdAt)) {
+          return activity.publicId;
+        } else {
+          return idEncode(activity.id, IDENTIFIER_TYPES.ACTIVITY);
+        }
+      },
+    },
+    publicId: {
+      type: new GraphQLNonNull(GraphQLString),
+      description: `The resource public id (ie: ${ActivityModel.nanoIdPrefix}_xxxxxxxx)`,
+    },
+    type: {
+      type: new GraphQLNonNull(GraphQLActivityType),
+      description: 'The type of the activity',
+    },
+    createdAt: {
+      type: new GraphQLNonNull(GraphQLDateTime),
+      description: 'The date on which the ConnectedAccount was created',
+    },
+    fromAccount: {
+      type: GraphQLAccount,
+      description: 'The account that authored by this activity, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Collective> => {
+        if (activity.FromCollectiveId) {
+          return req.loaders.Collective.byId.load(activity.FromCollectiveId);
+        }
+      },
+    },
+    account: {
+      type: GraphQLAccount,
+      description: 'The account targeted by this activity, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Collective> => {
+        if (activity.CollectiveId) {
+          return req.loaders.Collective.byId.load(activity.CollectiveId);
+        }
+      },
+    },
+    host: {
+      type: GraphQLHost,
+      description: 'The host under which this activity happened, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Collective> => {
+        if (activity.HostCollectiveId) {
+          return req.loaders.Collective.byId.load(activity.HostCollectiveId);
+        }
+      },
+    },
+    individual: {
+      type: GraphQLIndividual,
+      description: 'The person who triggered the action, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Collective> => {
+        if (!activity.UserId) {
+          return null;
+        }
+
+        const userCollective = await req.loaders.Collective.byUserId.load(activity.UserId);
+        if (!userCollective) {
+          return null;
+        }
+
+        // We check this just in case, but in practice `Users` are not supposed to be linked to incognito profiles directly
+        let isIncognito = userCollective.isIncognito;
+
+        // Check if **the profile** who triggered the action is incognito
+        if (!isIncognito && activity.FromCollectiveId) {
+          const fromCollective = await req.loaders.Collective.byId.load(activity.FromCollectiveId);
+          isIncognito = Boolean(fromCollective?.isIncognito);
+        }
+
+        if (isIncognito && !req.remoteUser?.isRoot() && !req.remoteUser?.isAdminOfCollective(userCollective)) {
+          return null;
+        }
+
+        return userCollective;
+      },
+    },
+    expense: {
+      type: GraphQLExpense,
+      description: 'The expense related to this activity, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Expense> => {
+        if (activity.ExpenseId) {
+          return req.loaders.Expense.byId.load(activity.ExpenseId);
+        }
+      },
+    },
+    order: {
+      type: GraphQLOrder,
+      description: 'The order related to this activity, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Order> => {
+        if (activity.OrderId) {
+          return req.loaders.Order.byId.load(activity.OrderId);
+        }
+      },
+    },
+    update: {
+      type: GraphQLUpdate,
+      description: 'The update related to this activity, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Update> => {
+        const updateId = activity.data?.UpdateId || activity.data?.update?.id;
+        if (updateId) {
+          return req.loaders.Update.byId.load(updateId);
+        }
+      },
+    },
+    conversation: {
+      type: GraphQLConversation,
+      description: 'The conversation related to this activity, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Conversation> => {
+        const conversationId = activity.data?.ConversationId || activity.data?.conversation?.id;
+        if (conversationId) {
+          return req.loaders.Conversation.byId.load(conversationId);
+        }
+      },
+    },
+    transaction: {
+      type: GraphQLTransaction,
+      description: 'The transaction related to this activity, if any',
+      resolve: async (activity, _, req: express.Request): Promise<Transaction> => {
+        if (activity.TransactionId) {
+          return req.loaders.Transaction.byId.load(activity.TransactionId);
+        }
+      },
+    },
+    data: {
+      type: new GraphQLNonNull(GraphQLJSON),
+      description: 'Data attached to this activity (if any)',
+      async resolve(activity, _, req: express.Request): Promise<Record<string, unknown>> {
+        return sanitizeActivityData(req, activity);
+      },
+    },
+    isSystem: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description: 'Specifies whether this is a system generated activity',
+      resolve: activity => Boolean(activity.data?.isSystem),
+    },
+  }),
+});

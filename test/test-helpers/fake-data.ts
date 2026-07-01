@@ -1,0 +1,1527 @@
+// We often use `utils.data` (ie. utils.data('collective1')) in the code to generate test
+// data. This approach is enough in certain cases but it has flows:
+// - Collectives with unique columns (slugs) cannot be created without resetting the DB
+// - No randomness in produced values
+//
+// This lib is a superset of `utils.data` that generates values that are random and safe
+// to use in loops and repeated tests.
+
+import config from 'config';
+import { get, kebabCase, merge, padStart, sample } from 'lodash';
+import moment from 'moment';
+import { generateSecret } from 'otplib';
+import type { CreateOptions, InferCreationAttributes } from 'sequelize';
+import { v4 as uuid } from 'uuid';
+
+import { activities, channels, roles } from '../../server/constants';
+import { CollectiveType } from '../../server/constants/collectives';
+import { SupportedCurrency } from '../../server/constants/currencies';
+import { SUPPORTED_FILE_KINDS } from '../../server/constants/file-kind';
+import OAuthScopes from '../../server/constants/oauth-scopes';
+import OrderStatuses from '../../server/constants/order-status';
+import PaymentIntentStatus from '../../server/constants/payment-intent-status';
+import PaymentIntentType from '../../server/constants/payment-intent-type';
+import { PAYMENT_METHOD_SERVICES, PAYMENT_METHOD_TYPES } from '../../server/constants/paymentMethods';
+import { REACTION_EMOJI } from '../../server/constants/reaction-emoji';
+import MemberRoles from '../../server/constants/roles';
+import { TransactionKind } from '../../server/constants/transaction-kind';
+import { VirtualCardLimitIntervals } from '../../server/constants/virtual-cards';
+import { crypto } from '../../server/lib/encryption';
+import { KYCProviderName } from '../../server/lib/kyc/providers';
+import { createTransactionsForManuallyPaidExpense } from '../../server/lib/transactions';
+import { TwoFactorMethod } from '../../server/lib/two-factor-authentication';
+import { parseToBoolean } from '../../server/lib/utils';
+import models, {
+  Agreement,
+  Collective,
+  ConnectedAccount,
+  EmojiReaction,
+  ExpenseAttachedFile,
+  ExpenseItem,
+  Location,
+  Notification,
+  PaypalProduct,
+  PersonalToken,
+  PlatformSubscription,
+  RequiredLegalDocument,
+  sequelize,
+  Subscription,
+  Tier,
+  TransactionsImport,
+  TransactionsImportRow,
+  Update,
+  UploadedFile,
+  VirtualCard,
+  VirtualCardRequest,
+} from '../../server/models';
+import AccountingCategory from '../../server/models/AccountingCategory';
+import Application, { ApplicationType } from '../../server/models/Application';
+import Comment from '../../server/models/Comment';
+import Conversation from '../../server/models/Conversation';
+import ExportRequest, { ExportRequestTypes } from '../../server/models/ExportRequest';
+import HostApplication, { HostApplicationStatus } from '../../server/models/HostApplication';
+import { KYCVerification, KYCVerificationStatus } from '../../server/models/KYCVerification';
+import LegalDocument, { LEGAL_DOCUMENT_SERVICE, LEGAL_DOCUMENT_TYPE } from '../../server/models/LegalDocument';
+import ManualPaymentProvider, { ManualPaymentProviderTypes } from '../../server/models/ManualPaymentProvider';
+import Member from '../../server/models/Member';
+import MemberInvitation from '../../server/models/MemberInvitation';
+import Order from '../../server/models/Order';
+import PaymentIntent from '../../server/models/PaymentIntent';
+import PaymentMethod from '../../server/models/PaymentMethod';
+import PayoutMethod, { PayoutMethodTypes } from '../../server/models/PayoutMethod';
+import { Billing } from '../../server/models/PlatformSubscription';
+import RecurringExpense, { RecurringExpenseIntervals } from '../../server/models/RecurringExpense';
+import SocialLink, { SocialLinkType } from '../../server/models/SocialLink';
+import { AssetType } from '../../server/models/SuspendedAsset';
+import Transaction, { TransactionCreationAttributes } from '../../server/models/Transaction';
+import { SUPPORTED_FILE_EXTENSIONS, SUPPORTED_FILE_TYPES } from '../../server/models/UploadedFile';
+import User from '../../server/models/User';
+import UserToken, { TokenType } from '../../server/models/UserToken';
+import UserTwoFactorMethod from '../../server/models/UserTwoFactorMethod';
+import { VirtualCardStatus } from '../../server/models/VirtualCard';
+import { VirtualCardRequestStatus } from '../../server/models/VirtualCardRequest';
+import { randEmail, randUrl } from '../stores';
+
+export { randEmail, sequelize };
+export const randStr = (prefix = '') => `${prefix}${uuid().split('-')[0]}`;
+export const randNumber = (min = 0, max = 10000000) => Math.floor(Math.random() * max) + min;
+export const randAmount = (min = 100, max = 10000000) => randNumber(min, max);
+export const multiple = <T extends (...args: any[]) => Promise<any>>(
+  fn: T,
+  n: number,
+  ...args: Parameters<T>
+): Promise<Array<Awaited<ReturnType<T>>>> => Promise.all([...Array(n).keys()].map(() => fn(...args)));
+export const fakeOpenCollectiveS3URL = ({ key = randStr(), bucket = config.aws.s3.bucket } = {}) => {
+  if (config.aws.s3.endpoint && parseToBoolean(config.aws.s3.forcePathStyle)) {
+    return `${config.aws.s3.endpoint}/${bucket}/${key}`;
+  } else {
+    return `https://${bucket}.s3.us-west-1.amazonaws.com/${key}`;
+  }
+};
+export function fakeUploadedFileURL(kind, filename = uuid()) {
+  return fakeOpenCollectiveS3URL({ key: `${kebabCase(kind)}/${uuid()}/${filename}` });
+}
+
+const randStrOfLength = length =>
+  Math.round(Math.pow(36, length + 1) - Math.random() * Math.pow(36, length))
+    .toString(36)
+    .slice(1);
+
+// For nullable fields, this helper will randomly
+const optionally = async (fn, probability = 0.5) => (Math.random() < probability ? fn() : null);
+
+/** Generate an array containing between min and max item, filled with generateFunc */
+export const randArray = (generateFunc, min = 1, max = 1) => {
+  const arrayLength = randNumber(min, max);
+  return [...Array(arrayLength)].map((_, idx) => generateFunc(idx, arrayLength));
+};
+
+export const randIPV4 = () => {
+  return [randNumber(1, 255), randNumber(1, 255), randNumber(1, 255), randNumber(1, 255)].join('.');
+};
+
+/**
+ * Allows to generate an UUID with the first 8 characters hardcoded. This is useful to generate
+ * random but identifiable valid UUIDs.
+ */
+export const fakeUUID = firstHeightChars => {
+  return `${firstHeightChars}-${uuid().substr(9)}`;
+};
+
+/**
+ * Creates a fake accounting category. All params are optionals.
+ */
+export const fakeAccountingCategory = async (
+  accountingCategoryData: Partial<InferCreationAttributes<AccountingCategory>> = {},
+) => {
+  const category = await models.AccountingCategory.create({
+    code: randStr('AC-'),
+    name: randStr('Accounting Category '),
+    friendlyName: randStr('Accounting Category '),
+    ...accountingCategoryData,
+    CollectiveId: accountingCategoryData?.CollectiveId ?? (await fakeHost()).id,
+  });
+
+  category.collective = await models.Collective.findByPk(category.CollectiveId);
+  return category;
+};
+
+/**
+ * Creates a fake host agreement.
+ */
+export const fakeAgreement = async (values: Partial<InferCreationAttributes<Agreement>> = {}) => {
+  return models.Agreement.create({
+    title: randStr('Agreement '),
+    notes: randStr('Notes: Agreement for  '),
+    ...values,
+    CollectiveId: values?.CollectiveId ?? (await fakeCollective()).id,
+    HostCollectiveId: values?.HostCollectiveId ?? (await fakeActiveHost()).id,
+  });
+};
+
+/**
+ * Creates a fake user. All params are optionals.
+ */
+export const fakeUser = async (
+  userData: Record<string, unknown> = {},
+  collectiveData: Record<string, unknown> = {},
+  { enable2FA = false } = {},
+): Promise<User> => {
+  const generate2FAAuthToken = () => {
+    const twoFactorAuthSecret = generateSecret({ length: 64 });
+    return crypto.encrypt(twoFactorAuthSecret).toString();
+  };
+
+  const user = await models.User.create({
+    email: randEmail(),
+    twoFactorAuthToken: enable2FA ? generate2FAAuthToken() : null,
+    ...userData,
+  });
+
+  if (user.twoFactorAuthToken) {
+    await UserTwoFactorMethod.create({
+      UserId: user.id,
+      method: TwoFactorMethod.TOTP,
+      name: 'TOTP',
+      data: { secret: user.twoFactorAuthToken },
+    });
+  }
+
+  const userCollective = await fakeCollective({
+    type: CollectiveType.USER,
+    name: (userData?.name as string) || randStr('User Name'),
+    slug: randStr('user-'),
+    data: { UserId: user.id },
+    HostCollectiveId: null,
+    CreatedByUserId: user.id,
+    ...collectiveData,
+    isActive: false,
+  });
+
+  await user.update({ CollectiveId: userCollective.id });
+  user.collective = userCollective;
+  return user;
+};
+
+export const fakeUserTwoFactorMethod = async (
+  data: Partial<
+    | InferCreationAttributes<UserTwoFactorMethod<TwoFactorMethod.TOTP>>
+    | InferCreationAttributes<UserTwoFactorMethod<TwoFactorMethod.WEBAUTHN>>
+    | InferCreationAttributes<UserTwoFactorMethod<TwoFactorMethod.YUBIKEY_OTP>>
+  > = {},
+) => {
+  const user = data.UserId ? await models.User.findByPk(data.UserId) : await fakeUser();
+  return models.UserTwoFactorMethod.create({
+    ...data,
+    UserId: user.id,
+    method: data.method || TwoFactorMethod.TOTP,
+    name: data.name || 'Generic TOTP',
+    data: data.data || { secret: 'secret' },
+  });
+};
+
+export const fakeIncognitoProfile = async user => {
+  const incognitoCollective = await fakeCollective({
+    type: CollectiveType.USER,
+    name: 'Incognito',
+    slug: randStr('incognito-'),
+    HostCollectiveId: null,
+    CreatedByUserId: user.id,
+    isIncognito: true,
+    data: { UserCollectiveId: user.CollectiveId, UserId: user.id },
+  });
+  await fakeMember({ CollectiveId: incognitoCollective.id, MemberCollectiveId: user.CollectiveId, role: roles.ADMIN });
+  return incognitoCollective;
+};
+
+/** @deprecated: use fakeActiveHost */
+export const fakeHost = async (hostData: Parameters<typeof fakeCollective>[0] = {}) => {
+  return fakeCollective({
+    type: CollectiveType.ORGANIZATION,
+    name: randStr('Test Host '),
+    slug: randStr('host-'),
+    HostCollectiveId: null,
+    hasMoneyManagement: true,
+    hasHosting: true,
+    ...hostData,
+  });
+};
+
+/** Create a fake host */
+export const fakeActiveHost = async (hostData: Parameters<typeof fakeCollective>[0] = {}) => {
+  const host = await fakeCollective({
+    type: CollectiveType.ORGANIZATION,
+    name: randStr('Test Host '),
+    slug: randStr('host-'),
+    HostCollectiveId: null,
+    hasMoneyManagement: true,
+    isActive: true,
+    approvedAt: new Date(),
+    hasHosting: true,
+    ...hostData,
+  });
+
+  await host.update({ HostCollectiveId: host.id });
+  return host;
+};
+
+/** Create a fake vendor */
+export const fakeVendor = async (vendorData: Parameters<typeof fakeCollective>[0] = {}) => {
+  return fakeCollective({
+    type: CollectiveType.VENDOR,
+    name: randStr('Test Vendor '),
+    slug: randStr('vendor-'),
+    ParentCollectiveId: vendorData.ParentCollectiveId || (await fakeHost()).id,
+    ...vendorData,
+  });
+};
+
+/** Create a fake host application */
+export const fakeHostApplication = async (data: Partial<InferCreationAttributes<HostApplication>> = {}) => {
+  const CollectiveId = data.CollectiveId || (await fakeCollective()).id;
+  const HostCollectiveId = data.HostCollectiveId || (await fakeHost()).id;
+  return models.HostApplication.create({
+    status: HostApplicationStatus.PENDING,
+    ...data,
+    CollectiveId,
+    HostCollectiveId,
+  });
+};
+
+/**
+ * Creates a fake collective. All params are optionals.
+ */
+export const fakeCollective = async (
+  collectiveData: Partial<InferCreationAttributes<Collective>> & {
+    admin?: User | { id: number; CreatedByUserId: number } | User[] | { id: number; CreatedByUserId: number }[];
+  } = {},
+  sequelizeParams: CreateOptions = {},
+) => {
+  const type = collectiveData.type || CollectiveType.COLLECTIVE;
+  if (!collectiveData.CreatedByUserId) {
+    collectiveData.CreatedByUserId = (await fakeUser()).id;
+  }
+  if (collectiveData.HostCollectiveId === undefined) {
+    collectiveData.HostCollectiveId = (await fakeActiveHost({ hasHosting: true })).id;
+  }
+
+  const collectiveSequelizeParams = Object.assign({}, sequelizeParams);
+
+  if (collectiveData.location) {
+    collectiveSequelizeParams.include = [{ association: 'location' }];
+  }
+
+  const collective = await models.Collective.create(
+    {
+      type,
+      name: collectiveData.hasMoneyManagement ? randStr('Test Host ') : randStr('Test Collective '),
+      slug: collectiveData.hasMoneyManagement ? randStr('host-') : randStr('collective-'),
+      description: randStr('Description '),
+      currency: 'USD',
+      twitterHandle: randStr('twitter'),
+      website: randUrl(),
+      hostFeePercent: 10,
+      tags: [randStr(), randStr()],
+      isActive: true,
+      approvedAt: collectiveData.HostCollectiveId ? new Date() : null,
+      ...collectiveData,
+    },
+    collectiveSequelizeParams,
+  );
+
+  if (collective.hasMoneyManagement && !collective.HostCollectiveId && collectiveData.HostCollectiveId === undefined) {
+    await collective.update({ HostCollectiveId: collective.id });
+  }
+
+  collective.host = collective.HostCollectiveId && (await models.Collective.findByPk(collective.HostCollectiveId));
+  if (collective.host) {
+    try {
+      await models.Member.create(
+        {
+          CollectiveId: collective.id,
+          MemberCollectiveId: collective.host.id,
+          role: roles.HOST,
+          CreatedByUserId: collective.CreatedByUserId,
+        },
+        sequelizeParams,
+      );
+    } catch {
+      // Ignore if host is already linked
+    }
+  }
+  if (collectiveData.admin) {
+    try {
+      const admins = Array.isArray(collectiveData.admin) ? collectiveData.admin : [collectiveData.admin];
+      await Promise.all(
+        admins.map(admin => {
+          const isUser = admin instanceof models.User;
+          return models.Member.create(
+            {
+              CollectiveId: collective.id,
+              MemberCollectiveId: isUser ? admin.CollectiveId : admin.id,
+              role: roles.ADMIN,
+              CreatedByUserId: isUser ? admin.id : admin.CreatedByUserId,
+            },
+            sequelizeParams,
+          );
+        }),
+      );
+
+      // Re-populate roles for affected users
+      await Promise.all(
+        admins.map(admin => {
+          if (admin instanceof models.User) {
+            return admin.populateRoles({ force: true });
+          }
+        }),
+      );
+    } catch {
+      // Ignore if host is already linked
+    }
+  }
+
+  return collective;
+};
+
+export const fakeOrganization = (organizationData: Record<string, unknown> = {}) => {
+  return fakeCollective({
+    HostCollectiveId: null,
+    name: organizationData.hasMoneyManagement ? randStr('Test Host ') : randStr('Test Organization '),
+    slug: organizationData.hasMoneyManagement ? randStr('host-') : randStr('org-'),
+    ...organizationData,
+    type: CollectiveType.ORGANIZATION,
+  });
+};
+
+/** Creates a fake private organization (not a host). */
+export const fakePrivateOrganization = (organizationData: Record<string, unknown> = {}) => {
+  return fakeOrganization({ isPrivate: true, ...organizationData });
+};
+
+/** Creates a fake private host (organization with money management, isPrivate=true). */
+export const fakePrivateHost = async (hostData: Parameters<typeof fakeActiveHost>[0] = {}) => {
+  return fakeActiveHost({ isPrivate: true, ...hostData });
+};
+
+/**
+ * Creates a fake event. All params are optionals.
+ */
+export const fakeEvent = async (collectiveData: Record<string, unknown> & { ParentCollectiveId?: number } = {}) => {
+  const ParentCollectiveId = collectiveData.ParentCollectiveId || (await fakeCollective()).id;
+  const parentCollective = await models.Collective.findByPk(ParentCollectiveId);
+  return fakeCollective({
+    name: randStr('Test Event '),
+    slug: randStr('event-'),
+    ...collectiveData,
+    type: CollectiveType.EVENT,
+    ParentCollectiveId: ParentCollectiveId,
+    HostCollectiveId: parentCollective.HostCollectiveId,
+  });
+};
+
+/**
+ * Creates a fake project. All params are optionals.
+ */
+export const fakeProject = async (collectiveData: Record<string, unknown> & { ParentCollectiveId?: number } = {}) => {
+  const ParentCollectiveId = collectiveData.ParentCollectiveId || (await fakeCollective()).id;
+  const parentCollective = await models.Collective.findByPk(ParentCollectiveId);
+  return fakeCollective({
+    name: randStr('Test Project '),
+    slug: randStr('project-'),
+    ...collectiveData,
+    type: CollectiveType.PROJECT,
+    ParentCollectiveId: ParentCollectiveId,
+    HostCollectiveId: parentCollective.HostCollectiveId,
+  });
+};
+
+/**
+ * Creates a fake update. All params are optionals.
+ */
+export const fakeUpdate = async (
+  updateData: Partial<InferCreationAttributes<Update>> = {},
+  sequelizeParams: CreateOptions = {},
+) => {
+  const update = await models.Update.create(
+    {
+      slug: randStr('update-'),
+      title: randStr('Update '),
+      html: '<div><strong>Hello</strong> Test!</div>',
+      ...updateData,
+      FromCollectiveId: updateData.FromCollectiveId || (await fakeCollective()).id,
+      CollectiveId: updateData.CollectiveId || (await fakeCollective()).id,
+      CreatedByUserId: (updateData.CreatedByUserId as number) || (await fakeUser()).id,
+    },
+    sequelizeParams,
+  );
+
+  update.collective = await models.Collective.findByPk(update.CollectiveId);
+  update.fromCollective = await models.Collective.findByPk(update.FromCollectiveId);
+  return update;
+};
+
+/**
+ * Creates a fake expense item
+ */
+export const fakeExpenseItem = async (itemData: Partial<InferCreationAttributes<ExpenseItem>> = {}) => {
+  const expense = await (itemData.ExpenseId ? models.Expense.findByPk(itemData.ExpenseId) : fakeExpense());
+  return models.ExpenseItem.create({
+    amount: randAmount(),
+    url: <string>itemData.url || `${randUrl()}.pdf`,
+    description: randStr(),
+    currency: expense.currency,
+    ...itemData,
+    ExpenseId: expense.id,
+    CreatedByUserId: <number>itemData.CreatedByUserId || (await fakeUser()).id,
+  });
+};
+
+export const fakeExpenseAttachedFile = async (
+  attachmentData: Partial<InferCreationAttributes<ExpenseAttachedFile>> = {},
+): Promise<ExpenseAttachedFile> => {
+  return models.ExpenseAttachedFile.create({
+    url: <string>attachmentData.url || `${randUrl()}.pdf`,
+    ...attachmentData,
+    ExpenseId: (attachmentData.ExpenseId as number) || (await fakeExpense({ items: [] })).id,
+    CreatedByUserId: <number>attachmentData.CreatedByUserId || (await fakeUser()).id,
+  });
+};
+
+export const fakeUploadedFile = async (fileData: Partial<InferCreationAttributes<UploadedFile>> = {}) => {
+  const fileType = sample(SUPPORTED_FILE_TYPES);
+  const extension = SUPPORTED_FILE_EXTENSIONS[fileType];
+  const fileName = `${randStr()}${extension}`;
+  const kind = sample(SUPPORTED_FILE_KINDS);
+  return models.UploadedFile.create({
+    url: fakeUploadedFileURL(fileData?.kind || kind, fileName),
+    kind,
+    fileSize: randNumber(100, 100000),
+    fileName,
+    fileType,
+    ...fileData,
+    CreatedByUserId: <number>fileData?.CreatedByUserId || (await fakeUser()).id,
+  });
+};
+
+/**
+ * Fake a Payout Method (defaults to PayPal)
+ */
+export const fakePayoutMethod = async ({
+  data,
+  type,
+  CollectiveId,
+  CreatedByUserId,
+  ...props
+}: Partial<InferCreationAttributes<PayoutMethod>> = {}) => {
+  const generateData = type => {
+    if (type === PayoutMethodTypes.PAYPAL) {
+      return { email: randEmail(), currency: 'USD', ...data };
+    } else if (type === PayoutMethodTypes.OTHER) {
+      return { content: randStr(), ...data };
+    } else if (type === PayoutMethodTypes.BANK_ACCOUNT) {
+      return {
+        accountHolderName: 'Jesse Pinkman',
+        currency: 'EUR',
+        type: 'iban',
+        details: { iban: 'DE1237812738192OK' },
+        ...data,
+      };
+    } else if (type === PayoutMethodTypes.STRIPE) {
+      return {
+        stripeAccountId: 'stripeAccountId',
+        connectedAccountId: 'connectedAccountId',
+        ...data,
+      };
+    } else if (type === PayoutMethodTypes.CREDIT_CARD) {
+      return {
+        token: 'token',
+        ...data,
+      };
+    } else {
+      return {};
+    }
+  };
+
+  type = type || PayoutMethodTypes.PAYPAL;
+  return models.PayoutMethod.create({
+    name: randStr('Fake Payout Method '),
+    data: generateData(type),
+    ...props,
+    type: type as PayoutMethodTypes,
+    CollectiveId: CollectiveId || (await fakeCollective()).id,
+    CreatedByUserId: <number>CreatedByUserId || (await fakeUser()).id,
+  });
+};
+
+/**
+ * Creates a fake expense. All params are optionals.
+ */
+export const fakeExpense = async (expenseData: Record<string, unknown> = {}) => {
+  let PayoutMethodId = expenseData.PayoutMethodId as number;
+  if (expenseData.legacyPayoutMethod && PayoutMethodId) {
+    throw new Error('legacyPayoutMethod and PayoutMethodId are exclusive in fakeExpense');
+  } else if (expenseData.legacyPayoutMethod) {
+    const pm = await fakePayoutMethod({
+      type: models.Expense.getPayoutMethodTypeFromLegacy(<string>expenseData.legacyPayoutMethod),
+    });
+    PayoutMethodId = pm.id;
+  } else if (!PayoutMethodId) {
+    PayoutMethodId = (await fakePayoutMethod()).id;
+  }
+
+  const payoutMethod = await models.PayoutMethod.findByPk(PayoutMethodId);
+  const legacyPayoutMethod = models.Expense.getLegacyPayoutMethodTypeFromPayoutMethod(payoutMethod);
+  const user = await (expenseData.UserId ? models.User.findByPk(<number>expenseData.UserId) : fakeUser());
+  const expense = await models.Expense.create({
+    amount: randAmount(),
+    currency: 'USD',
+    tags: ['Engineering'],
+    description: randStr('Test expense '),
+    incurredAt: new Date(),
+    ...expenseData,
+    FromCollectiveId: (expenseData.FromCollectiveId as number) || user.CollectiveId,
+    CollectiveId: (expenseData.CollectiveId as number) || (await fakeCollective()).id,
+    UserId: user.id,
+    lastEditedById: (expenseData.lastEditedById as number) || user.id,
+    PayoutMethodId,
+    legacyPayoutMethod,
+  });
+
+  const items = expenseData.items as Array<Record<string, unknown>> | undefined;
+  if (typeof items === 'undefined') {
+    // Helper to generate an attachment. Ensures that items match expense amount
+    const generateAttachment = (idx, nbItems) => {
+      const baseAmount = Math.floor(expense.amount / nbItems);
+      const remainder = expense.amount % nbItems;
+      const realAmount = idx !== nbItems - 1 ? baseAmount : baseAmount + remainder;
+      return fakeExpenseItem({ ExpenseId: expense.id, amount: realAmount });
+    };
+
+    expense.items = await Promise.all(randArray(generateAttachment, 1, 5));
+  } else if (items?.every(item => !item.id)) {
+    expense.items = await Promise.all(items.map(item => fakeExpenseItem({ ...item, ExpenseId: expense.id })));
+  }
+
+  expense.User = await models.User.findByPk(expense.UserId);
+  expense.fromCollective = await models.Collective.findByPk(expense.FromCollectiveId);
+  expense.collective = await models.Collective.findByPk(expense.CollectiveId, {
+    include: [{ association: 'host' }],
+  });
+  return expense;
+};
+
+export const fakePaidExpense = async (
+  expenseData: { paymentProcessorFeeInHostCurrency?: number; createdAt?: Date } & Parameters<
+    typeof fakeExpense
+  >[0] = {},
+) => {
+  const expense = await fakeExpense({ ...expenseData, status: 'PAID' });
+  const paymentProcessorFeeInHostCurrency =
+    expenseData.paymentProcessorFeeInHostCurrency || randAmount(1, expense.amount / 10);
+  const totalAmountPaidInHostCurrency = expense.amount + paymentProcessorFeeInHostCurrency;
+  expense['Transactions'] = [
+    await createTransactionsForManuallyPaidExpense(
+      expense.collective.host,
+      expense,
+      paymentProcessorFeeInHostCurrency,
+      totalAmountPaidInHostCurrency,
+      { clearedAt: expenseData.createdAt || new Date() },
+    ),
+  ];
+
+  return expense;
+};
+
+/**
+ * Creates a fake comment. All params are optionals.
+ */
+export const fakeComment = async (
+  commentData: Partial<InferCreationAttributes<Comment>> = {},
+  sequelizeParams: CreateOptions = {},
+): Promise<Comment> => {
+  let FromCollectiveId = get(commentData, 'FromCollectiveId') || get(commentData, 'fromCollective.id');
+  let CollectiveId = get(commentData, 'CollectiveId') || get(commentData, 'collective.id');
+  let CreatedByUserId = get(commentData, 'CreatedByUserId') || get(commentData, 'createdByUser.id');
+  let ExpenseId = get(commentData, 'ExpenseId') || get(commentData, 'expense.id');
+  const ConversationId = get(commentData, 'ConversationId') || get(commentData, 'conversation.id');
+  const HostApplicationId = get(commentData, 'HostApplicationId') || get(commentData, 'hostApplication.id');
+  if (!FromCollectiveId) {
+    FromCollectiveId = (await fakeCollective({}, sequelizeParams)).id;
+  }
+  if (!CollectiveId) {
+    CollectiveId = (await fakeCollective({}, sequelizeParams)).id;
+  }
+  if (!CreatedByUserId) {
+    CreatedByUserId = (await fakeUser()).id;
+  }
+  if (!ExpenseId && !ConversationId && !HostApplicationId) {
+    ExpenseId = (await fakeExpense()).id;
+  }
+
+  const comment = await models.Comment.create(
+    {
+      html: '<div><strong>Hello</strong> Test comment!</div>',
+      ...commentData,
+      FromCollectiveId: <number>FromCollectiveId,
+      CollectiveId: <number>CollectiveId,
+      CreatedByUserId: <number>CreatedByUserId,
+      ExpenseId: <number>ExpenseId,
+      ConversationId: <number>ConversationId,
+    },
+    sequelizeParams,
+  );
+
+  comment.fromCollective = await models.Collective.findByPk(FromCollectiveId);
+  comment.collective = await models.Collective.findByPk(CollectiveId);
+  return comment;
+};
+
+/**
+ * Creates a fake comment reaction. All params are optionals.
+ */
+export const fakeEmojiReaction = async (
+  reactionData: Partial<InferCreationAttributes<EmojiReaction>> = {},
+  opts: Record<string, unknown> = {},
+) => {
+  const UserId = <number>reactionData.UserId || (await fakeUser()).id;
+  const user = await models.User.findByPk(UserId);
+  const FromCollectiveId = reactionData.FromCollectiveId || (await models.Collective.findByPk(user.CollectiveId)).id;
+  if (opts.isComment) {
+    const ConversationId = (await fakeConversation()).id;
+    const CommentId = <number>reactionData.CommentId || (await fakeComment({ ConversationId })).id;
+    return models.EmojiReaction.create({
+      UserId,
+      FromCollectiveId,
+      CommentId,
+      emoji: sample(REACTION_EMOJI),
+      ...reactionData,
+    });
+  } else {
+    const UpdateId = reactionData.UpdateId || (await fakeUpdate()).id;
+    return models.EmojiReaction.create({
+      UserId,
+      FromCollectiveId,
+      UpdateId,
+      emoji: sample(REACTION_EMOJI),
+      ...reactionData,
+    });
+  }
+};
+
+export const fakeConversation = async (
+  conversationData: Partial<InferCreationAttributes<Conversation>> = {},
+  sequelizeParams: CreateOptions = {},
+): Promise<Conversation> => {
+  const RootCommentId = <number>conversationData.RootCommentId || (await fakeComment({}, sequelizeParams)).id;
+  const rootComment = await models.Comment.findByPk(RootCommentId);
+  return models.Conversation.create(
+    {
+      title: randStr('Update '),
+      summary: rootComment.html,
+      FromCollectiveId: conversationData.FromCollectiveId || (await fakeCollective()).id,
+      CollectiveId: conversationData.CollectiveId || (await fakeCollective()).id,
+      CreatedByUserId: <number>conversationData.CreatedByUserId || (await fakeUser()).id,
+      RootCommentId: <number>conversationData.RootCommentId || (await fakeComment()).id,
+      ...conversationData,
+    },
+    sequelizeParams,
+  );
+};
+
+/**
+ * Creates a fake tier. All params are optionals.
+ */
+export const fakeTier = async (tierData: Partial<InferCreationAttributes<Tier>> = {}) => {
+  const name = randStr('tier');
+  const interval = <'month' | 'year'>sample(['month', 'year']);
+  const currency = <SupportedCurrency>tierData.currency || sample<SupportedCurrency>(['USD', 'EUR']);
+  const amount = <number>tierData.amount || randAmount(1, 100) * 100;
+  const description = `$${amount / 100}/${interval}`;
+
+  return models.Tier.create({
+    name,
+    type: 'TIER',
+    slug: name,
+    description,
+    amount,
+    interval,
+    currency,
+    maxQuantity: randAmount(),
+    ...tierData,
+    CollectiveId: tierData.CollectiveId || (await fakeCollective()).id,
+  });
+};
+
+/**
+ * Creates a fake order. All params are optionals.
+ */
+export const fakeOrder = async (
+  orderData: Partial<InferCreationAttributes<Order>> & { subscription?: any } = {},
+  { withSubscription = false, withTransactions = false, withBackerMember = false, withTier = false } = {},
+) => {
+  const CreatedByUserId = orderData.CreatedByUserId || (await fakeUser()).id;
+  const user = await models.User.findByPk(<number>CreatedByUserId);
+  const fromCollective = await models.Collective.findByPk(user.CollectiveId);
+  const FromCollectiveId = orderData.FromCollectiveId || fromCollective.id;
+  const collective = orderData.CollectiveId
+    ? await models.Collective.findByPk(orderData.CollectiveId)
+    : await fakeCollective();
+  const tier = orderData.TierId
+    ? await models.Tier.findByPk(<number>orderData.TierId)
+    : withTier
+      ? await fakeTier()
+      : null;
+  const data = {
+    ...orderData.data,
+    fromAccountInfo: {
+      name: fromCollective.name,
+      email: user.email,
+    },
+  };
+
+  const order: Order & {
+    subscription?: typeof Subscription;
+    transactions?: Transaction[];
+  } = await models.Order.create({
+    quantity: 1,
+    currency: collective.currency,
+    totalAmount: randAmount(100, 99999999),
+    status: withSubscription ? OrderStatuses.ACTIVE : OrderStatuses.PAID,
+    ...orderData,
+    TierId: tier?.id || null,
+    CreatedByUserId,
+    FromCollectiveId,
+    CollectiveId: collective.id,
+    data,
+  });
+
+  if (order.PaymentMethodId) {
+    order.paymentMethod = await models.PaymentMethod.findByPk(order.PaymentMethodId);
+  }
+
+  if (withSubscription) {
+    const subscriptionData = {
+      amount: order.totalAmount,
+      interval: order.interval || 'month',
+      currency: order.currency,
+      isActive: true,
+      quantity: order.quantity,
+      ...orderData.subscription,
+    };
+
+    if (order.paymentMethod?.type === 'subscription' && order.paymentMethod.service === 'paypal') {
+      subscriptionData.paypalSubscriptionId = order.paymentMethod.token;
+    }
+
+    const subscription = await fakeSubscription(subscriptionData);
+    await order.update({ SubscriptionId: subscription.id });
+    order.Subscription = subscription;
+  }
+
+  if (withTransactions) {
+    const transactionGroup = uuid();
+    order.transactions = await Promise.all([
+      fakeTransaction({
+        OrderId: order.id,
+        type: 'CREDIT',
+        kind: TransactionKind.CONTRIBUTION,
+        FromCollectiveId: order.FromCollectiveId,
+        CollectiveId: order.CollectiveId,
+        HostCollectiveId: collective.HostCollectiveId,
+        amount: order.totalAmount,
+        PaymentMethodId: order.PaymentMethodId,
+        TransactionGroup: transactionGroup,
+      }),
+      fakeTransaction({
+        OrderId: order.id,
+        type: 'DEBIT',
+        kind: TransactionKind.CONTRIBUTION,
+        CollectiveId: order.FromCollectiveId,
+        FromCollectiveId: order.CollectiveId,
+        amount: -order.totalAmount,
+        PaymentMethodId: order.PaymentMethodId,
+        TransactionGroup: transactionGroup,
+      }),
+    ]);
+  }
+
+  if (withBackerMember) {
+    await fakeMember({
+      MemberCollectiveId: order.FromCollectiveId,
+      CollectiveId: order.CollectiveId,
+      CreatedByUserId: order.CreatedByUserId,
+      role: MemberRoles.BACKER,
+      TierId: tier?.id || null,
+    });
+  }
+
+  order.fromCollective = await models.Collective.findByPk(order.FromCollectiveId);
+  order.collective = collective;
+  order.createdByUser = user;
+  order.tier = tier;
+  return order;
+};
+
+export const fakeSocialLink = async (data: Partial<InferCreationAttributes<SocialLink>> = {}) => {
+  return models.SocialLink.create({
+    type: sample(Object.values(SocialLinkType)),
+    url: randUrl(),
+    order: 1,
+    ...data,
+    CollectiveId: data.CollectiveId || (await fakeCollective()).id,
+  });
+};
+
+export const fakeSubscription = (params = {}) => {
+  return models.Subscription.create({
+    amount: randAmount(),
+    currency: sample<SupportedCurrency>(['USD', 'EUR']),
+    interval: <'month' | 'year'>sample(['month', 'year']),
+    isActive: true,
+    quantity: 1,
+    ...params,
+  });
+};
+
+export const fakeNotification = async (data: Partial<InferCreationAttributes<Notification>> = {}) => {
+  return models.Notification.create({
+    channel: sample(Object.values(channels)),
+    type: sample(Object.values(activities)),
+    active: true,
+    CollectiveId: data.CollectiveId || (await fakeCollective()).id,
+    UserId: <number>data.UserId || (await fakeUser()).id,
+    webhookUrl: randUrl('example.com/webhooks'),
+    ...data,
+  });
+};
+
+/**
+ * Pass `hooks: false` to `sequelizeParams` to prevent triggering a notification.
+ */
+export const fakeActivity = async (
+  data: Record<string, unknown> = {},
+  sequelizeParams: Record<string, unknown> = { hooks: false },
+) => {
+  return models.Activity.create(
+    {
+      CollectiveId: data.CollectiveId || (await optionally(() => fakeCollective().then(c => c.id))),
+      FromCollectiveId: data.FromCollectiveId || (await optionally(() => fakeCollective().then(c => c.id))),
+      HostCollectiveId: data.HostCollectiveId || (await optionally(() => fakeHost().then(c => c.id))),
+      UserId: <number>data.UserId || (await fakeUser()).id,
+      type: sample(Object.values(activities)),
+      ...data,
+    },
+    sequelizeParams,
+  );
+};
+
+/**
+ * Creates a fake connectedAccount. All params are optionals.
+ */
+export const fakeConnectedAccount = async (
+  connectedAccountData: Partial<InferCreationAttributes<ConnectedAccount>> = {},
+  sequelizeParams: Record<string, unknown> = {},
+) => {
+  const CollectiveId = connectedAccountData.CollectiveId || (await fakeCollective({}, sequelizeParams)).id;
+  const service = connectedAccountData.service || sample(['github', 'twitter', 'stripe', 'transferwise']);
+
+  const connectedAccount = await models.ConnectedAccount.create(
+    {
+      service,
+      clientId: randStr('client-id-'),
+      token: randStr('token-'),
+      username: service === 'stripe' ? randStr('username-') : undefined,
+      ...connectedAccountData,
+      CollectiveId,
+    },
+    sequelizeParams,
+  );
+
+  connectedAccount.collective = await models.Collective.findByPk(connectedAccount.CollectiveId);
+  return connectedAccount;
+};
+
+/**
+ * Creates a fake transaction. All params are optionals.
+ */
+export const fakeTransaction = async (
+  transactionData: Partial<TransactionCreationAttributes> = {},
+  { settlementStatus = undefined, createDoubleEntry = false } = {},
+) => {
+  const amount = (transactionData.amount as number) || randAmount(10, 100) * 100;
+  const CreatedByUserId = transactionData.CreatedByUserId || (await fakeUser()).id;
+  const FromCollectiveId = transactionData.FromCollectiveId || (await fakeCollective()).id;
+  const collective = transactionData.CollectiveId
+    ? await models.Collective.findByPk(transactionData.CollectiveId)
+    : await fakeCollective();
+  const createMethod = createDoubleEntry ? 'createDoubleEntry' : 'create';
+  const transaction = await models.Transaction[createMethod](
+    {
+      type: amount < 0 ? 'DEBIT' : 'CREDIT',
+      currency: transactionData.currency || 'USD',
+      hostCurrency: transactionData.hostCurrency || 'USD',
+      hostCurrencyFxRate: 1,
+      netAmountInCollectiveCurrency: amount,
+      amountInHostCurrency: amount,
+      TransactionGroup: uuid(),
+      kind: transactionData.ExpenseId ? TransactionKind.EXPENSE : null,
+      isDebt: Boolean(settlementStatus),
+      hostFeeInHostCurrency: 0,
+      platformFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      ...transactionData,
+      amount,
+      CreatedByUserId,
+      FromCollectiveId,
+      CollectiveId: collective.id,
+    },
+    // In the context of tests, we disable hooks because they can conflict with SQL transactions
+    // E.g.: afterCreate: transaction => Transaction.createActivity(transaction)
+    { hooks: false },
+  );
+
+  if (settlementStatus) {
+    await models.TransactionSettlement.create({
+      TransactionGroup: transaction.TransactionGroup,
+      kind: transaction.kind,
+      status: settlementStatus,
+    });
+  }
+
+  return transaction;
+};
+
+export const fakeTransactionsImport = async (data: Partial<InferCreationAttributes<TransactionsImport>> = {}) => {
+  const transactionsImport = await models.TransactionsImport.create({
+    type: 'MANUAL',
+    source: randStr('source'),
+    name: randStr('name'),
+    CollectiveId: data.CollectiveId || (await fakeCollective()).id,
+    ...data,
+  });
+
+  transactionsImport.collective = await transactionsImport.getCollective();
+  return transactionsImport;
+};
+
+export const fakeTransactionsImportRow = async (data: Partial<InferCreationAttributes<TransactionsImportRow>> = {}) => {
+  return models.TransactionsImportRow.create({
+    amount: randAmount(),
+    currency: 'USD',
+    sourceId: randStr('sourceId'),
+    date: new Date(),
+    ...data,
+    TransactionsImportId: data.TransactionsImportId || (await fakeTransactionsImport()).id,
+  });
+};
+
+/**
+ * Creates a fake member. All params are optionals.
+ */
+export const fakeMember = async (data: Partial<InferCreationAttributes<Member>> = {}) => {
+  const collective = data.CollectiveId ? await models.Collective.findByPk(data.CollectiveId) : await fakeCollective();
+  const memberCollective = data.MemberCollectiveId
+    ? await models.Collective.findByPk(data.MemberCollectiveId)
+    : await fakeCollective();
+  const member = await models.Member.create({
+    ...data,
+    CollectiveId: collective.id,
+    MemberCollectiveId: memberCollective.id,
+    role: data.role || roles.ADMIN,
+    CreatedByUserId:
+      data.CreatedByUserId ?? collective.CreatedByUserId ?? memberCollective.CreatedByUserId ?? (await fakeUser()).id,
+  });
+
+  // Attach associations
+  member.collective = collective;
+  member.memberCollective = memberCollective;
+  return member;
+};
+
+/**
+ * Creates a fake member invitation
+ */
+export const fakeMemberInvitation = async (data: Partial<InferCreationAttributes<MemberInvitation>> = {}) => {
+  const collective = data.CollectiveId ? await models.Collective.findByPk(data.CollectiveId) : await fakeCollective();
+  const memberCollective = data.MemberCollectiveId
+    ? await models.Collective.findByPk(data.MemberCollectiveId)
+    : (await fakeUser()).collective;
+  const member = await models.MemberInvitation.create({
+    ...data,
+    CollectiveId: collective.id,
+    MemberCollectiveId: memberCollective.id,
+    role: data.role || roles.ADMIN,
+    CreatedByUserId:
+      data.CreatedByUserId ?? collective.CreatedByUserId ?? memberCollective.CreatedByUserId ?? (await fakeUser()).id,
+  });
+
+  // Attach associations
+  member.collective = collective;
+  member.memberCollective = memberCollective;
+  return member;
+};
+
+const fakePaymentMethodToken = (service, type) => {
+  if (service === 'stripe' && type === 'creditcard') {
+    return `pm_${randStrOfLength(24)}`;
+  } else {
+    return randStr();
+  }
+};
+
+/**
+ * Creates a fake Payment Method. All params are optionals.
+ */
+export const fakePaymentMethod = async (data: Partial<InferCreationAttributes<PaymentMethod>> = {}) => {
+  const service = data.service || sample(PAYMENT_METHOD_SERVICES);
+  const type = data.type || sample(PAYMENT_METHOD_TYPES);
+  const token = data.token || fakePaymentMethodToken(service, type);
+  return models.PaymentMethod.create({
+    ...data,
+    type,
+    service,
+    token,
+    CollectiveId: data.CollectiveId || (await fakeCollective().then(c => c.id)),
+    currency: data.currency || 'USD',
+  });
+};
+
+export const fakeRequiredLegalDocument = async (data: Partial<InferCreationAttributes<RequiredLegalDocument>> = {}) => {
+  return models.RequiredLegalDocument.create({
+    ...data,
+    documentType: LEGAL_DOCUMENT_TYPE.US_TAX_FORM,
+    HostCollectiveId: data.HostCollectiveId || (await fakeCollective().then(c => c.id)),
+  });
+};
+
+export const fakeLegalDocument = async (data: Partial<InferCreationAttributes<LegalDocument>> = {}) => {
+  return models.LegalDocument.create({
+    year: new Date().getFullYear(),
+    requestStatus: 'REQUESTED',
+    ...data,
+    service: sample([LEGAL_DOCUMENT_SERVICE.DROPBOX_FORMS, LEGAL_DOCUMENT_SERVICE.OPENCOLLECTIVE]),
+    CollectiveId: data.CollectiveId || (await fakeCollective().then(c => c.id)),
+  });
+};
+
+export const fakeLocation = async (data: Partial<InferCreationAttributes<Location>> = {}) => {
+  const countries = ['US', 'SE', 'FR', 'BE'];
+
+  return models.Location.create({
+    country: sample(countries),
+    address: randStr('Formatted Address '),
+    structured: {
+      address1: randStr('Address1 '),
+      address2: randStr('Address2 '),
+      city: randStr('City '),
+      postalCode: randNumber(10000, 99999).toString(),
+      zone: randStr('Zone '),
+    },
+    ...data,
+    CollectiveId: data.CollectiveId || (await fakeCollective().then(c => c.id)),
+  });
+};
+
+export const fakeCurrencyExchangeRate = async (data: Record<string, unknown> = {}) => {
+  const currencies = ['USD', 'NSG', 'EUR', 'CZK', 'JPY', 'MYR', 'AUD'];
+  return models.CurrencyExchangeRate.create({
+    from: sample(currencies),
+    to: sample(currencies),
+    rate: randNumber(0, 100) / 100.0,
+    ...data,
+  });
+};
+
+export const fakeVirtualCard = async (virtualCardData: Partial<InferCreationAttributes<VirtualCard>> = {}) => {
+  const CollectiveId = virtualCardData.CollectiveId || (await fakeCollective()).id;
+  const HostCollectiveId =
+    virtualCardData.HostCollectiveId || (await models.Collective.getHostCollectiveId(CollectiveId));
+
+  return models.VirtualCard.create({
+    id: uuid(),
+    last4: padStart(randNumber(0, 9999).toString(), 4, '0'),
+    name: randStr('card'),
+    ...virtualCardData,
+    data: {
+      status: VirtualCardStatus.ACTIVE,
+      ...virtualCardData.data,
+    },
+    CollectiveId,
+    HostCollectiveId,
+  });
+};
+
+export const fakeVirtualCardRequest = async (
+  virtualCardRequestData: Partial<InferCreationAttributes<VirtualCardRequest>> = {},
+) => {
+  const CollectiveId = virtualCardRequestData.CollectiveId || (await fakeCollective()).id;
+  const HostCollectiveId =
+    virtualCardRequestData.HostCollectiveId || (await models.Collective.getHostCollectiveId(CollectiveId));
+  return models.VirtualCardRequest.create({
+    purpose: randStr('purpose'),
+    notes: randStr('notes'),
+    status: VirtualCardRequestStatus.PENDING,
+    currency: 'USD',
+    spendingLimitAmount: randAmount(),
+    spendingLimitInterval: VirtualCardLimitIntervals.ALL_TIME,
+    ...virtualCardRequestData,
+    CollectiveId,
+    HostCollectiveId,
+    UserId: virtualCardRequestData.UserId || (await fakeUser()).id,
+  });
+};
+
+export const fakePaypalProduct = async (data: Partial<InferCreationAttributes<PaypalProduct>> = {}) => {
+  const CollectiveId = data.CollectiveId || (await fakeCollective()).id;
+  const collective = await models.Collective.findByPk(CollectiveId);
+  return models.PaypalProduct.create({
+    id: randStr('PaypalProduct-'),
+    ...data,
+    CollectiveId,
+    HostCollectiveId: collective.HostCollectiveId,
+  });
+};
+
+export const fakePaypalPlan = async (data: Record<string, unknown> = {}) => {
+  const product = data.ProductId
+    ? await models.PaypalProduct.findByPk(<number>data.ProductId)
+    : await fakePaypalProduct(<Record<string, unknown>>data.product || {});
+
+  const collective = await models.Collective.findByPk(product.CollectiveId);
+  return models.PaypalPlan.create({
+    currency: collective.currency || 'USD',
+    interval: sample(['month', 'year']),
+    amount: randAmount(),
+    id: randStr('PaypalPlan-'),
+    ...data,
+    ProductId: product.id,
+  });
+};
+
+export const fakePlatformSubscription = async (data: Partial<InferCreationAttributes<PlatformSubscription>> = {}) => {
+  const CollectiveId = data.CollectiveId || (await fakeCollective()).id;
+  return models.PlatformSubscription.create({
+    period: [{ value: new Date(), inclusive: true }, null],
+    ...data,
+    CollectiveId,
+  });
+};
+
+export const fakeApplication = async (data: Record<string, unknown> = {}) => {
+  let CollectiveId;
+  let CreatedByUserId;
+  if (data.user) {
+    const user = data.user as User;
+    CollectiveId = user.CollectiveId;
+    CreatedByUserId = user.id;
+  } else {
+    const user = data.CreatedByUserId ? await models.User.findByPk(<number>data.CreatedByUserId) : await fakeUser();
+    CreatedByUserId = user.id;
+    CollectiveId = data.CollectiveId || user.CollectiveId;
+  }
+
+  const application = await models.Application.create({
+    type: <ApplicationType>sample(['apiKey', 'oAuth']),
+    apiKey: randStr('ApiKey-'),
+    clientId: randStrOfLength(20),
+    clientSecret: randStrOfLength(40),
+    callbackUrl: randUrl(),
+    name: randStr('Name '),
+    description: randStr('Description '),
+    ...data,
+    CollectiveId,
+    CreatedByUserId,
+  });
+
+  return application.reload({ include: [{ association: 'createdByUser' }, { association: 'collective' }] });
+};
+
+export const fakePersonalToken = async ({
+  user,
+  ...data
+}: Partial<InferCreationAttributes<PersonalToken>> & {
+  user?: User;
+} = {}) => {
+  if (!user) {
+    user = data.UserId ? await models.User.findByPk(data.UserId) : await fakeUser();
+  }
+
+  const personalToken = await models.PersonalToken.create({
+    name: randStr('Name '),
+    token: randStr('Token-'),
+    scope: [OAuthScopes.account, OAuthScopes.transactions],
+    ...data,
+    CollectiveId: data.CollectiveId || user.CollectiveId,
+    UserId: user.id,
+  });
+
+  return personalToken.reload({ include: [{ association: 'user' }, { association: 'collective' }] });
+};
+
+export const fakeUserToken = async ({
+  user,
+  ...data
+}: Partial<InferCreationAttributes<UserToken>> & {
+  user?: User;
+} = {}) => {
+  if (!user) {
+    user = data.UserId ? await models.User.findByPk(data.UserId) : await fakeUser();
+  }
+
+  const userToken = await models.UserToken.create({
+    type: TokenType.OAUTH,
+    accessToken: randStr('Token-'),
+    refreshToken: randStr('RefreshToken-'),
+    accessTokenExpiresAt: moment().add(60, 'days').toDate(),
+    refreshTokenExpiresAt: moment().add(300, 'days').toDate(),
+    ...data,
+    UserId: user.id,
+    ApplicationId: <number>data.ApplicationId || (await fakeApplication({ user })).id,
+  });
+
+  // UserToken has a default scope that loads associations (which `.create` does not support)
+  return userToken.reload();
+};
+
+export const fakeOAuthAuthorizationCode = async (data: Record<string, unknown> = {}) => {
+  const user = <User>data.user || (data.UserId ? await models.User.findByPk(<number>data.UserId) : await fakeUser());
+  const application =
+    <Application>data.application ||
+    (data.ApplicationId
+      ? await models.Application.findByPk(<number>data.ApplicationId)
+      : await fakeApplication({ user }));
+
+  const authorization = await models.OAuthAuthorizationCode.create({
+    code: randStr('Code-'),
+    expiresAt: moment().add(60, 'days').toDate(),
+    redirectUri: application.callbackUrl,
+    ...data,
+    UserId: user.id,
+    ApplicationId: application.id,
+  });
+
+  // Bind associations
+  authorization.user = user;
+  authorization.application = application;
+
+  return authorization;
+};
+
+export const fakeRecurringExpense = async (data: Partial<InferCreationAttributes<RecurringExpense>> = {}) => {
+  const CollectiveId = data.CollectiveId || (await fakeCollective()).id;
+  const FromCollectiveId = data.FromCollectiveId || (await fakeCollective()).id;
+  return models.RecurringExpense.create({
+    ...data,
+    CollectiveId,
+    FromCollectiveId,
+    interval: <RecurringExpenseIntervals>data.interval || RecurringExpenseIntervals.MONTH,
+  });
+};
+
+export const fakeSuspendedAsset = async (
+  data: { type?: AssetType; fingerprint?: string; reason?: string; [key: string]: unknown } = {},
+) => {
+  return models.SuspendedAsset.create({
+    ...data,
+    type: data.type || sample(Object.values(AssetType)),
+    fingerprint: data.fingerprint || randStr('asset'),
+    reason: data.reason || 'for the sake of this test',
+  });
+};
+
+export const fakePlatformBill = (data: Partial<Billing> = {}): Billing => {
+  const dueDateMoment = moment(data.dueDate || '2025-08-01');
+  const totalAmount = data.totalAmount || randAmount(100, 100000);
+  return merge(
+    {
+      base: {
+        amount: totalAmount,
+      },
+      dueDate: dueDateMoment.toISOString(),
+      additional: {
+        total: 0,
+        amounts: {
+          expensesPaid: 0,
+          activeCollectives: 0,
+        },
+        utilization: {
+          expensesPaid: 0,
+          activeCollectives: 0,
+        },
+      },
+      baseAmount: totalAmount,
+      totalAmount: totalAmount,
+      utilization: {
+        expensesPaid: 1,
+        activeCollectives: 3,
+      },
+      collectiveId: 11004,
+      billingPeriod: {
+        year: 2025,
+        month: 6,
+      },
+      subscriptions: [
+        {
+          id: 35,
+          plan: {
+            type: 'Basic',
+            title: 'Plan title',
+            pricing: {
+              pricePerMonth: totalAmount,
+              includedCollectives: 10,
+              includedExpensesPerMonth: 10,
+              pricePerAdditionalExpense: 100,
+              pricePerAdditionalCollective: 100,
+            },
+          },
+          period: [
+            {
+              value: dueDateMoment.subtract(1, 'month').startOf('month').toISOString(),
+              inclusive: true,
+            },
+            {
+              value: dueDateMoment.subtract(1, 'month').endOf('month').toISOString(),
+              inclusive: false,
+            },
+          ],
+          createdAt: '2025-08-07T10:39:20.321Z',
+          updatedAt: '2025-08-15T12:36:09.922Z',
+        },
+        {
+          id: 1,
+          plan: {
+            type: 'Basic',
+            title: 'Plan title',
+            pricing: {
+              pricePerMonth: 1000,
+              includedCollectives: 10,
+              includedExpensesPerMonth: 10,
+              pricePerAdditionalExpense: 100,
+              pricePerAdditionalCollective: 100,
+            },
+          },
+          period: [
+            {
+              value: '2024-08-06T00:00:00.000Z',
+              inclusive: true,
+            },
+            {
+              value: '2025-07-06T00:00:00.000Z',
+              inclusive: false,
+            },
+          ],
+          createdAt: '2025-08-06T15:51:51.122Z',
+          updatedAt: '2025-08-06T15:51:51.122Z',
+        },
+      ],
+    },
+    data,
+  );
+};
+
+export async function fakeKYCVerification<Provider extends KYCProviderName = KYCProviderName>(
+  opts: Partial<InferCreationAttributes<KYCVerification<Provider>>> = {},
+): Promise<KYCVerification<Provider>> {
+  const status = opts.status || sample(Object.values(KYCVerificationStatus));
+  const provider = opts['provider'] || sample(Object.values(KYCProviderName));
+
+  const data = {
+    ...(status === KYCVerificationStatus.VERIFIED
+      ? {
+          legalName: randStr('legalName'),
+          legalAddress: randStr('legalAddress'),
+        }
+      : {}),
+    ...opts.data,
+  };
+  let providerData = opts['providerData'];
+  if (!providerData) {
+    switch (provider) {
+      case KYCProviderName.MANUAL:
+        (providerData as KYCVerification<KYCProviderName.MANUAL>['providerData']) = {
+          notes: randStr('notes'),
+        };
+        break;
+    }
+  }
+
+  const collectiveId = opts.CollectiveId ?? (await fakeCollective()).id;
+  const requestedByCollectiveId = opts.RequestedByCollectiveId ?? (await fakeOrganization()).id;
+
+  return await KYCVerification.create<KYCVerification<Provider>>({
+    status,
+    provider,
+    CollectiveId: collectiveId,
+    RequestedByCollectiveId: requestedByCollectiveId,
+    data,
+    providerData,
+    CreatedByUserId: opts.CreatedByUserId ?? (await fakeUser()).id,
+    verifiedAt: opts.verifiedAt ?? new Date(),
+    revokedAt: opts.revokedAt ?? (status === KYCVerificationStatus.REVOKED ? new Date() : null),
+  });
+}
+
+/**
+ * Creates a fake manual payment provider. All params are optional.
+ */
+export const fakeManualPaymentProvider = async (
+  data: Partial<{
+    CollectiveId: number;
+    type: ManualPaymentProviderTypes;
+    name: string;
+    instructions: string;
+    icon: string;
+    data: Record<string, unknown>;
+    order: number;
+    archivedAt: Date;
+  }> = {},
+): Promise<ManualPaymentProvider> => {
+  const CollectiveId = data.CollectiveId || (await fakeActiveHost()).id;
+  return ManualPaymentProvider.create({
+    type: ManualPaymentProviderTypes.BANK_TRANSFER,
+    name: randStr('Payment Provider '),
+    instructions: '<p>Please transfer to our bank account</p>',
+    icon: 'Landmark',
+    order: 0,
+    ...data,
+    CollectiveId,
+  });
+};
+
+/**
+ * Creates a fake export request. All params are optional.
+ */
+export const fakeExportRequest = async (exportRequestData: Partial<InferCreationAttributes<ExportRequest>> = {}) => {
+  const collective = exportRequestData.CollectiveId
+    ? await models.Collective.findByPk(exportRequestData.CollectiveId)
+    : await fakeCollective();
+  const createdByUser = exportRequestData.CreatedByUserId
+    ? await models.User.findByPk(exportRequestData.CreatedByUserId)
+    : await fakeUser();
+
+  return ExportRequest.create({
+    name: randStr('Export Request '),
+    type: ExportRequestTypes.TRANSACTIONS,
+    CollectiveId: collective.id,
+    CreatedByUserId: createdByUser.id,
+    ...exportRequestData,
+  });
+};
+
+/**
+ * Creates a fake payment intent. All params are optional.
+ */
+export const fakePaymentIntent = async (
+  data: Partial<InferCreationAttributes<PaymentIntent>> = {},
+): Promise<PaymentIntent> => {
+  const PayerCollectiveId = data.PayerCollectiveId !== undefined ? data.PayerCollectiveId : (await fakeCollective()).id;
+  const PayeeCollectiveId = data.PayeeCollectiveId !== undefined ? data.PayeeCollectiveId : (await fakeCollective()).id;
+
+  return PaymentIntent.create({
+    status: PaymentIntentStatus.PENDING,
+    type: PaymentIntentType.Contribution,
+    ...data,
+    PayerCollectiveId,
+    PayeeCollectiveId,
+  });
+};

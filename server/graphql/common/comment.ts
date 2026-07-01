@@ -1,0 +1,370 @@
+import { lowerCase, pick } from 'lodash';
+
+import ActivityTypes from '../../constants/activities';
+import ExpenseStatuses from '../../constants/expense-status';
+import { mustBeLoggedInTo } from '../../lib/auth';
+import { assertCanSeeAccount } from '../../lib/private-accounts';
+import models, { HostApplication, User } from '../../models';
+import Comment, { CommentType } from '../../models/Comment';
+import Conversation from '../../models/Conversation';
+import Expense from '../../models/Expense';
+import Order from '../../models/Order';
+import Update from '../../models/Update';
+import { canComment as canCommentOrder } from '../common/orders';
+import { NotFound, Unauthorized, ValidationFailed } from '../errors';
+
+import { canComment as canCommentExpense, canUsePrivateNotes as canUseExpensePrivateNotes } from './expenses';
+import { canCommentHostApplication, canMakePrivateNoteOnHostApplication } from './host-applications';
+import { checkRemoteUserCanUseComment } from './scope-check';
+import { canSeeUpdate } from './update';
+
+type CommentableEntity = Update | Expense | Conversation | Order | HostApplication;
+
+type CommentAssociationData = Pick<
+  Comment,
+  'UpdateId' | 'ExpenseId' | 'OrderId' | 'ConversationId' | 'HostApplicationId'
+>;
+
+const loadCommentedEntity = async (
+  commentValues: CommentAssociationData,
+  loaders: any,
+): Promise<[CommentableEntity, ActivityTypes, Record<string, any>]> => {
+  let activityType = ActivityTypes.COLLECTIVE_COMMENT_CREATED;
+  let entity: CommentableEntity;
+  let activityData: Record<string, any> = {};
+
+  if (commentValues.ExpenseId) {
+    activityType = ActivityTypes.EXPENSE_COMMENT_CREATED;
+    entity = (await loaders.Expense.byId.load(commentValues.ExpenseId)) as Expense;
+    if (entity) {
+      entity.fromCollective = await loaders.Collective.byId.load(entity.FromCollectiveId);
+      entity.collective = await loaders.Collective.byId.load(entity.CollectiveId);
+      activityData.fromCollective = entity.fromCollective.activity;
+      activityData.collective = entity.collective.activity;
+      activityData.expense = entity.info;
+      if (!entity.collective) {
+        return [null, activityType, activityData];
+      }
+    }
+  } else if (commentValues.ConversationId) {
+    activityType = ActivityTypes.CONVERSATION_COMMENT_CREATED;
+    entity = (await loaders.Conversation.byId.load(commentValues.ConversationId)) as Conversation;
+    if (entity) {
+      entity.collective = await loaders.Collective.byId.load(entity.CollectiveId);
+      if (!entity.collective) {
+        return [null, activityType, activityData];
+      }
+    }
+  } else if (commentValues.UpdateId) {
+    activityType = ActivityTypes.UPDATE_COMMENT_CREATED;
+    entity = (await loaders.Update.byId.load(commentValues.UpdateId)) as Update;
+    if (entity) {
+      entity.collective = await loaders.Collective.byId.load(entity.CollectiveId);
+      if (!entity.collective) {
+        return [null, activityType, activityData];
+      }
+    }
+  } else if (commentValues.OrderId) {
+    activityType = ActivityTypes.ORDER_COMMENT_CREATED;
+    entity = (await loaders.Order.byId.load(commentValues.OrderId)) as Order;
+    if (entity) {
+      entity.collective = await loaders.Collective.byId.load(entity.CollectiveId);
+      if (!entity.collective) {
+        return [null, activityType, activityData];
+      }
+    }
+  } else if (commentValues.HostApplicationId) {
+    entity = (await loaders.HostApplication.byId.load(commentValues.HostApplicationId)) as HostApplication;
+    if (entity) {
+      activityType = ActivityTypes.HOST_APPLICATION_COMMENT_CREATED;
+      entity.host = await loaders.Collective.byId.load(entity.HostCollectiveId);
+      entity.collective = await loaders.Collective.byId.load(entity.CollectiveId);
+      activityData = {
+        host: entity.host?.info,
+        collective: entity.collective?.info,
+      };
+    }
+  }
+
+  return [entity, activityType, activityData];
+};
+
+/* eslint-disable custom-errors/no-unthrown-errors */
+const getCommentPermissionsError = async (req, commentedEntity, commentType) => {
+  if (!commentedEntity?.collective) {
+    return new Unauthorized('Cannot find the account for the commented entity');
+  }
+
+  // Private accounts
+  if (commentedEntity.collective.isPrivate) {
+    try {
+      await assertCanSeeAccount(req, commentedEntity.collective);
+    } catch (error) {
+      return error;
+    }
+  }
+
+  // Entity-specific checks
+  if (commentedEntity instanceof Expense) {
+    if (!(await canCommentExpense(req, commentedEntity))) {
+      return new Unauthorized('You are not allowed to comment on this expense');
+    } else if (commentType === CommentType.PRIVATE_NOTE && !(await canUseExpensePrivateNotes(req, commentedEntity))) {
+      return new Unauthorized('You need to be a host admin to post comments in this context');
+    }
+  } else if (commentedEntity instanceof Update) {
+    if (!(await canSeeUpdate(req, commentedEntity))) {
+      return new Unauthorized('You do not have the permission to post comments on this update');
+    }
+  } else if (commentedEntity instanceof Order) {
+    if (!(await canCommentOrder(req, commentedEntity))) {
+      return new Unauthorized('You do not have the permission to post comments on this order');
+    } else if (commentType !== CommentType.PRIVATE_NOTE) {
+      return new Unauthorized('Only private notes are allowed on orders');
+    }
+  } else if (commentedEntity instanceof HostApplication) {
+    if (!(await canCommentHostApplication(req, commentedEntity as HostApplication))) {
+      return new Unauthorized('You do not have the permission to post comments on this host application');
+    } else if (
+      commentType === CommentType.PRIVATE_NOTE &&
+      !(await canMakePrivateNoteOnHostApplication(req, commentedEntity))
+    ) {
+      return new Unauthorized('You need to be a host admin to post comments in this context');
+    }
+  }
+};
+/* eslint-enable custom-errors/no-unthrown-errors */
+
+export async function canSeeComment(req, comment: Comment): Promise<boolean> {
+  const [entity] = await loadCommentedEntity(comment, req.loaders);
+  const error = await getCommentPermissionsError(req, entity, comment.type);
+  return !error;
+}
+
+const loadCommentWithAccounts = (id: number) => {
+  return Comment.findByPk(id, {
+    include: [
+      {
+        association: 'collective',
+        required: false,
+      },
+      {
+        association: 'fromCollective',
+        required: false,
+      },
+    ],
+  });
+};
+
+const canEditComment = (remoteUser: User, comment: Comment): boolean => {
+  if (remoteUser.id === comment.CreatedByUserId) {
+    return true;
+  } else if (
+    remoteUser.isAdminOfCollective(comment.collective) ||
+    remoteUser.isAdminOfCollective(comment.fromCollective)
+  ) {
+    return true;
+  } else if (comment.UpdateId || comment.ConversationId) {
+    return remoteUser.isCommunityManager(comment.fromCollective) || remoteUser.isCommunityManager(comment.collective);
+  } else {
+    return false;
+  }
+};
+
+const EXPENSE_LOCKED_STATUSES = [
+  ExpenseStatuses.PROCESSING,
+  ExpenseStatuses.PAID,
+  ExpenseStatuses.SCHEDULED_FOR_PAYMENT,
+];
+
+/**
+ * Throws if the comment belongs to an expense that is in a locked status (paid, processing, or scheduled for payment).
+ * Fiscal host admins are exempt from this restriction.
+ */
+async function assertCanEditOrDeleteComment(req, comment: Comment, action: 'edit' | 'delete'): Promise<void> {
+  // Private notes
+  if (comment.type === CommentType.PRIVATE_NOTE) {
+    if (!req.remoteUser) {
+      throw new Unauthorized('You need to be logged in to edit or delete this comment');
+    } else if (comment.HostApplicationId) {
+      const hostApplication = await req.loaders.HostApplication.byId.load(comment.HostApplicationId);
+      if (!hostApplication || !req.remoteUser.isAdmin(hostApplication.HostCollectiveId)) {
+        throw new Unauthorized('You need to be a host admin to edit or delete this comment');
+      }
+      return;
+    } else if (comment.ExpenseId) {
+      const expense = await req.loaders.Expense.byId.load(comment.ExpenseId);
+      const collective = expense && (await req.loaders.Collective.byId.load(expense.CollectiveId));
+      const hostCollectiveId = expense?.HostCollectiveId || collective?.HostCollectiveId;
+      if (!hostCollectiveId || !req.remoteUser.isAdmin(hostCollectiveId)) {
+        throw new Unauthorized('You need to be a host admin to edit or delete this comment');
+      }
+      return;
+    } else if (comment.OrderId) {
+      const order = await req.loaders.Order.byId.load(comment.OrderId);
+      const collective = order && (await req.loaders.Collective.byId.load(order.CollectiveId));
+      if (!collective?.HostCollectiveId || !req.remoteUser.isAdmin(collective.HostCollectiveId)) {
+        throw new Unauthorized('You need to be a host admin to edit or delete this comment');
+      }
+      return;
+    } else {
+      // Throwing here means we've added privates notes on a new entity type without checking permissions
+      throw new Unauthorized('You are not authorized to edit or delete this private note');
+    }
+  }
+
+  // General case
+  if (!canEditComment(req.remoteUser, comment)) {
+    throw new Unauthorized(
+      action === 'edit'
+        ? 'You must be the author, an admin, or a community manager of this collective to edit this comment'
+        : 'You need to be logged in as the author, an admin, a community manager, or as a host to delete this comment',
+    );
+  }
+}
+
+async function assertExpenseIsNotFulfilled(comment: Comment, remoteUser?: User): Promise<void> {
+  if (comment.ExpenseId) {
+    const expense = await Expense.findByPk(comment.ExpenseId);
+    if (expense && EXPENSE_LOCKED_STATUSES.includes(expense.status as ExpenseStatuses)) {
+      const hostCollectiveId =
+        expense.HostCollectiveId ||
+        (await models.Collective.findByPk(expense.CollectiveId).then(c => c?.HostCollectiveId));
+      if (hostCollectiveId && remoteUser?.isAdmin(hostCollectiveId)) {
+        return;
+      }
+      throw new ValidationFailed(
+        `You cannot edit or delete comments on expenses that are ${lowerCase(expense.status)}`,
+      );
+    }
+  }
+}
+
+/**
+ *  Edits a comment
+ * @param {object} comment - comment to edit
+ * @param {object} remoteUser - logged user
+ */
+async function editComment(commentData, req): Promise<Comment> {
+  mustBeLoggedInTo(req.remoteUser, 'edit this comment');
+
+  const comment = await loadCommentWithAccounts(commentData.id);
+  if (!comment) {
+    throw new NotFound(`This comment does not exist or has been deleted.`);
+  }
+
+  await assertCanEditOrDeleteComment(req, comment, 'edit');
+
+  checkRemoteUserCanUseComment(comment, req);
+  await assertExpenseIsNotFulfilled(comment, req.remoteUser);
+
+  // Prepare args and update
+  const editableAttributes = ['html'];
+  return await comment.update(pick(commentData, editableAttributes));
+}
+
+/**
+ *  Deletes a comment
+ * @param {number} id - comment identifier
+ * @param {object} remoteUser - logged user
+ */
+async function deleteComment(id: number, req): Promise<void> {
+  mustBeLoggedInTo(req.remoteUser, 'delete this comment');
+
+  const comment = await loadCommentWithAccounts(id);
+  if (!comment) {
+    throw new NotFound(`This comment does not exist or has been deleted.`);
+  }
+
+  await assertCanEditOrDeleteComment(req, comment, 'delete');
+
+  checkRemoteUserCanUseComment(comment, req);
+  await assertExpenseIsNotFulfilled(comment, req.remoteUser);
+
+  return comment.destroy();
+}
+
+async function createComment(commentData, req): Promise<Comment> {
+  const { remoteUser } = req;
+  mustBeLoggedInTo(remoteUser, 'create a comment');
+
+  checkRemoteUserCanUseComment(commentData, req);
+
+  if (!commentData.html) {
+    throw new ValidationFailed('Comment is empty');
+  }
+
+  const { ConversationId, ExpenseId, UpdateId, OrderId, HostApplicationId, html, type } = commentData;
+
+  // Ensure at least (and only) one entity to comment is specified
+  if ([ConversationId, ExpenseId, UpdateId, OrderId, HostApplicationId].filter(Boolean).length !== 1) {
+    throw new ValidationFailed('You must specify one entity to comment');
+  }
+
+  // Load entity and its collective id
+  const [commentedEntity, activityType, activityData] = await loadCommentedEntity(commentData, req.loaders);
+  if (!commentedEntity) {
+    throw new ValidationFailed("The item you're trying to comment doesn't exist or has been deleted.");
+  }
+
+  // Check for permissions
+  const error = await getCommentPermissionsError(req, commentedEntity, type);
+  if (error) {
+    throw error;
+  }
+
+  // Create comment
+  const comment = await Comment.create({
+    CreatedByUserId: remoteUser.id,
+    FromCollectiveId: remoteUser.CollectiveId,
+    CollectiveId: commentedEntity.collective.id,
+    ExpenseId,
+    UpdateId,
+    ConversationId,
+    HostApplicationId,
+    html, // HTML is sanitized at the model level, no need to do it here
+    type,
+  });
+
+  // Create activity
+  await models.Activity.create({
+    type: activityType,
+    UserId: comment.CreatedByUserId,
+    CollectiveId: comment.CollectiveId,
+    FromCollectiveId: comment.FromCollectiveId,
+    HostCollectiveId:
+      commentedEntity instanceof HostApplication
+        ? commentedEntity.HostCollectiveId
+        : commentedEntity.collective.approvedAt
+          ? commentedEntity.collective.HostCollectiveId
+          : null,
+    ExpenseId: comment.ExpenseId,
+    OrderId: comment.OrderId,
+    data: {
+      CommentId: comment.id,
+      comment: { id: comment.id, html: comment.html, type: comment.type, publicId: comment.publicId },
+      FromCollectiveId: comment.FromCollectiveId,
+      ExpenseId: comment.ExpenseId,
+      UpdateId: comment.UpdateId,
+      OrderId: comment.OrderId,
+      ConversationId: comment.ConversationId,
+      HostApplicationId: comment.HostApplicationId,
+      ...activityData,
+    },
+  });
+
+  if (ConversationId) {
+    models.ConversationFollower.follow(remoteUser.id, ConversationId);
+  }
+
+  return comment;
+}
+
+function collectiveResolver({ CollectiveId }, _, { loaders }) {
+  return loaders.Collective.byId.load(CollectiveId);
+}
+
+function fromCollectiveResolver({ FromCollectiveId }, _, { loaders }) {
+  return loaders.Collective.byId.load(FromCollectiveId);
+}
+
+export { editComment, deleteComment, createComment, collectiveResolver, fromCollectiveResolver };

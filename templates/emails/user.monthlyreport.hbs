@@ -1,0 +1,268 @@
+Subject: {{capitalize month}} Open Collective Report
+
+<style>
+  h1, h2, h3, h4, h5, h6, p { margin: 0; }
+  p {
+    font-family: Helvetica;
+    font-size: 14px;
+    line-height: 2;
+    color: #494b4d;
+    margin: 10px 0px;
+  }
+  h1 {
+    font-family: Helvetica;
+    font-size: 24px;
+    font-weight: 600;
+    color: #494b4d;
+  }
+  h2 {
+    font-family: Helvetica;
+    font-size: 20px;
+    font-weight: bold;
+    line-height: 1.4;
+    color: #494b4d;
+  }
+  a {
+    color: #3a9fe8;
+    text-decoration: none;
+  }
+</style>
+
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+  }
+  .MonthlyReport {
+    padding-bottom: 20px;
+    padding-top: 64px;
+    padding-left: 4px;
+    padding-right: 4px;
+    width: 100%;
+  }
+  .Wrapper {
+    max-width: 620px;
+    margin: 0 auto;
+  }
+  .Wrapper > p {
+    margin-bottom: 60px;
+  }
+  .Wrapper > p, .Wrapper > a  {
+    font-family: Helvetica;
+    font-size: 10px;
+    line-height: 1.9;
+    text-align: center;
+    color: #919599;
+  }
+</style>
+
+<style>
+  .Container {
+    width: 100%;
+    min-height: 200px;
+    background-color: #fff;
+    box-shadow: 0 1px 4px 0 rgba(173, 176, 179, 0.6);
+    border-top: 8px solid #7fadf2;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    border-bottom-left-radius: 4px;
+    border-bottom-right-radius: 4px;
+  }
+  .ContainerLogo {
+    display: block;
+    margin: 0 auto;
+    margin-top: -44px; /* (60-24) + 8border */
+    width: 80px;
+    height: 80px;
+    background-color: #fff;
+    border-radius: 100%;
+    box-shadow: 0 1px 4px 0 rgba(173, 176, 179, 0.6);
+    background-image: url({{config.host.website}}/static/images/opencollectiveicon-240x240.png);
+    background-repeat: no-repeat;
+    background-size: 64px;
+    background-position: center;
+  }
+  .ContainerLogoName {
+    width: 220px;
+    height: 32px;
+    margin: 0 auto;
+    margin-bottom: 40px;
+    background-image: url({{config.host.website}}/static/images/email/oc-logo-name.png);
+    background-repeat: no-repeat;
+    background-size: contain;
+    background-position: center;
+    margin-top: 16px; /*opt*/
+  }
+</style>
+
+<style>
+  .Section {
+    padding: 0 8px;
+  }
+  .Section.Intro {
+    padding-bottom: 68px;
+  }
+  .Section.Intro h2 {
+    margin-bottom: 12px;
+  }
+  .Section.Subscriptions {
+    border-top: 1px solid #d5d7d9;
+    padding-bottom: 48px;
+  }
+  .Section.Subscriptions > h1 {
+    margin: -14px 0 0 -8px;
+    background-color: white;
+    display: inline-block;
+    padding: 0 10px 0 8px;
+  }
+  .Section.Subscriptions .Date {
+    text-transform: uppercase;
+    margin: 8px 0px 44px 0px;
+    display: block;
+    height: 12px;
+    font-family: Helvetica;
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 3px;
+    color: #aaaeb3;
+  }
+  .Section.Interest {
+    border-top: 1px solid #d5d7d9;
+    background-color: #fafcfd;
+    padding-top: 48px;
+    padding-left: 8px;
+    padding-right: 8px;
+    width: 100%;
+  }
+  .Section.Interest .Cards {
+    padding-top: 32px;
+    padding-bottom: 32px;
+    min-height: 300px;
+    overflow: hidden;
+    text-align: center;
+  }
+  .Section.Interest .CollectiveCard {
+    margin: 10px;
+  }
+  .Section.Interest h3 {
+    font-family: Montserrat, Helvetica;
+    font-size: 16px;
+    font-weight: 600;
+    text-align: center;
+    color: #494b4d;
+  }
+  .Section.Notice {
+    background-color: #fafcfd;
+    padding-top: 24px;
+    padding-bottom: 68px;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .Section.Notice p {
+    font-family: Helvetica;
+    font-size: 13px;
+    line-height: 1.46;
+    text-align: center;
+    color: #6d7073;
+  }
+  .Section.Notice > p {
+    margin-bottom: 8px;
+  }
+  .Section.Notice > p:last-child {
+    margin-bottom: 0;
+  }
+  ul.intro li {
+    font-size: 14px;
+    line-height: 2;
+    color: #494b4d;
+    margin: 10px 0;
+  }
+</style>
+
+<style>
+  @media (max-width:660px) {
+    .Wrapper {
+      max-width: 600px !important;
+    }
+    .Section.Intro {
+      padding: 0 8px !important;
+      padding-bottom: 48px !important;
+    }
+    .Section.Intro p {
+      font-size: 12px !important;
+      line-height: 2 !important;
+    }
+    .Section.Intro h1 {
+      font-size: 20px !important;
+      line-height: 1 !important;
+    }
+    .Section.Intro .Date {
+      font-size: 12px !important;
+      margin-bottom: 32px !important;
+    }
+    .Section.Subscriptions {
+      padding: 0 8px !important;
+      padding-bottom: 48px !important;
+    }
+    .Section.Notice {
+      padding-bottom: 60px !important;
+    }
+  }
+</style>
+
+
+<div class="MonthlyReport">
+  <div class="Wrapper">
+   <!-- <p>If you are having problems viewing this email, please <a href='{{fallbackUrl}}">click here</a>.</p> -->
+    <div class="Container">
+      <a class="ContainerLogo" href="//opencollective.com"></a>
+      <div class="ContainerLogoName"></div>
+      <div class="Section Intro">
+        <h2>Hi {{fromCollective.name}} 👋</h2>
+        <ul class="intro">
+          <li>In {{month}}, you have backed {{stats.collectives}} {{pluralize "collective" n=stats.collectives}} for a total of {{stats.totalDonatedString}}. Thank you for your {{pluralize "contribution" n=stats.collectives}}! 🙌
+          {{#if stats.expenses}}<br />These Collectives have spent a total of {{stats.totalSpentString}} in expenses.{{/if}}
+          {{#if consolidatedPdfs}}<br />You can find PDFs of all your contributions, organized by fiscal host, attached to this email.{{/if}}</li>
+          {{#each collectives}}
+            {{#if nextGoal}}
+              <li><a href="{{../config.host.website}}/{{slug}}">{{name}}</a> needs {{currency nextGoal.missing.amount currency=currency}} more {{#if nextGoal.missing.interval}}per {{nextGoal.missing.interval}}{{/if}} to reach their next goal of {{nextGoal.title}} ({{nextGoal.percentage}} there).
+              {{#if order.Subscription}}
+              You are currently contributing {{currency order.Subscription.amount currency=order.Subscription.currency}} per {{order.Subscription.interval}}.
+              (<a href="{{../config.host.website}}/recurring-contributions">increase your contribution</a>)
+              {{else}}
+              You have contributed {{order.netAmount}} {{#if order.platformTipAmount}}(+ {{currency order.platformTipAmount currency=order.currency}} tip to the Open Collective Platform){{/if}}.
+              (<a href="{{../config.host.website}}/{{slug}}/donate">increase your contribution</a>)
+              {{/if}}
+              </li>
+            {{/if}}
+          {{/each}}
+        </ul>
+      </div>
+      <div class="Section Subscriptions">
+        <h1>Collectives backed in {{month}}</h1>
+        <span class="Date">{{month}} {{year}}</span>
+        <table>
+          {{#each collectives}}
+          <tr><td>{{> mr-subscription}}</td></tr>
+          <tr><td height="20"></td></tr>
+          {{/each}}
+        </table>
+      </div>
+      <div class="Section Notice">
+        <p>We hope that you find this report useful. Do not hesitate to send us your feedback or ideas. Just reply to this email!</p>
+
+        <p>To manage your recurring contributions, <a href="{{manageSubscriptionsUrl}}">click here</a>.</p>
+
+        <p>
+        {{#if notificationTypeLabel}}
+        To unsubscribe from "{{notificationTypeLabel}}", <a href="{{unsubscribeUrl}}">click here</a>.<br /><br />
+        {{/if}}
+        </p>
+
+        <p>Come chat with us on our <a href="https://discord.opencollective.com">Discord</a>.</p>
+      </div>
+      {{> mr-footer}}
+    </div>
+  </div>
+</div>

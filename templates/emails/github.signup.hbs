@@ -1,0 +1,136 @@
+Subject: {{{collective.name}}}: Your Collective is live!
+
+{{> header}}
+
+<style>
+.actions {
+  margin: 0 auto;
+  text-align: center;
+}
+.actions a {
+  margin: 5px;
+}
+img.step {
+  margin-top: 5px;
+}
+ol {
+  padding: 0px 20px 5px;
+}
+li {
+  margin: 15px 0px;
+  line-height: 1.4;
+}
+h3 {
+  margin-top: 0;
+}
+.grey {
+  color: #AAAEB3;
+}
+.cover {
+  background: url('{{config.host.website}}/static/images/email/confetti.png') no-repeat center center;
+  text-align: center;
+}
+</style>
+
+
+<div class="cover">
+
+  <img src="{{config.host.website}}/static/images/email/welcome.png" />
+
+  <h1>Welcome {{collective.name}},</h1>
+
+  <h2>Thanks for signing up on Open Collective!</h2>
+
+</div>
+
+<br />
+<br />
+<br />
+
+<table>
+  <tbody>
+    <tr class="grey">
+      <td valign="top" width="50"><img src="{{config.host.website}}/static/images/email/vertical-line-green.png" width="30" /></td>
+      <td valign="top">
+        <h3 class="grey">Create</h3>
+        <p class="grey">Your Collective {{> linkCollective collective=collective}} has been created. Share this link and start accepting financial contributions: <a href="{{config.host.website}}/{{collective.slug}}">{{config.host.website}}/{{collective.slug}}</a></p>
+      </td>
+      <td valign="top">
+        <img src="{{config.host.website}}/static/images/email/github.signup.step1.png" width="180" />
+      </td>
+    </tr>
+    <tr><td colspan="3" height="30"></td></tr>
+    <tr>
+      <td valign="top" width="50"><img src="{{config.host.website}}/static/images/email/vertical-line-grey.png" width="30"  class="step"/></td>
+      <td valign="top">
+        <h3>Customize</h3>
+        <p>Make this Collective your own! Add a logo, cover image, pick your color, and fill out your About section, by clicking those elements of your page. You can also <a href="{{config.host.website}}/dashboard/{{collective.slug}}">visit your settings</a> to create custom contribution tiers and add more team members. (<a href="https://documentation.opencollective.com/collectives/creating-a-collective">learn more</a>).</p>
+      </td>
+      <td valign="top">
+        <img src="{{config.host.website}}/static/images/email/github.signup.step2.png" width="180" />
+      </td>
+    </tr>
+    <tr><td colspan="3" height="30"></td></tr>
+    <tr>
+      <td valign="top" width="50"><img src="{{config.host.website}}/static/images/email/vertical-line-grey.png" width="30"  class="step"/></td>
+      <td valign="top">
+        <h3>Integrate</h3>
+        <p>You can show your contributors on your GitHub README and website and create an embeddable donate button using
+          <a href="https://documentation.opencollective.com/collectives/raising-money/adding-donation-buttons-badges-and-banners">widgets</a>, connect your Collective to
+          <a href="https://documentation.opencollective.com/collective-settings/github-sponsors">GitHub Sponsors</a>, and
+          <a href="https://documentation.opencollective.com/collectives/raising-money/adding-embeds-to-your-website">embed contributions</a> on
+          your website, so people don't have to leave in order to pay. You can also use webhooks to connect to your socials, Slack, Discord or other chat—<a href="https://documentation.opencollective.com/collective-settings/integrations">here's how</a>.</p>
+        </div>
+      </td>
+      <td valign="top">
+        <img src="{{config.host.website}}/static/images/email/github.signup.step3.png" width="180" />
+      </td>
+    </tr>
+    <tr><td colspan="3" height="30"></td></tr>
+    <tr>
+      <td valign="top" width="50"><img src="{{config.host.website}}/static/images/email/vertical-line-grey.png" width="30"  class="step"/></td>
+      <td valign="top">
+        <h3>Engage</h3>
+        <p>Spread the word! Reach out on social media, post an issue, and directly ask companies who use your tools to support you. <a href="https://documentation.opencollective.com/advanced/keeping-your-community-updated/updates-and-contact">Updates</a> are a great way to let everyone know what their contributions are supporting. In case you attract any unwanted attention, we also have <a href="https://documentation.opencollective.com/advanced/keeping-your-community-updated/conversations#moderation">spam and moderation tools</a>.</p>
+      </td>
+      <td valign="top">
+        <img src="{{config.host.website}}/static/images/email/github.signup.step4.png" width="180" />
+      </td>
+    </tr>
+    <tr><td colspan="3" height="30"></td></tr>
+    <tr>
+      <td valign="top" width="50"><img src="{{config.host.website}}/static/images/email/vertical-line-grey.png" width="30"  class="step"/></td>
+      <td valign="top">
+        <h3>Receive and Spend Money</h3>
+        <p>If you're looking for tips on fundraising, check out <a href="https://blog.opencollective.com/ten-steps-to-successful-open-source-crowdfunding/">Ten Steps to Open Source Crowdfunding</a>, and if you're looking for ideas about spending it, read <a href="https://blog.opencollective.com/has-your-open-source-community-raised-money-heres-how-to-spend-it/">
+          Has Your Open Source Community Raised Money? Here’s How to Spend It</a>. When you're ready to pay out from your Collective, <a href="https://documentation.opencollective.com/expenses-and-getting-paid/submitting-expenses">submit an expense</a>.</p>
+      </td>
+      <td valign="top">
+        <img src="{{config.host.website}}/static/images/email/github.signup.step5.png" width="180" />
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<br />
+<br />
+<br />
+
+<h1>Need inspiration?</h1>
+<h2>See how other <a href="https://opencollective.com/discover">Collectives</a> are raising and spending funds, and read how-tos and case studies on the <a href="https://blog.opencollective.com">blog</a>.</h2>
+
+<br />
+<br />
+<br />
+
+<p class="center">
+  If you have questions, <a href="https://discord.opencollective.com">join our Discord</a> or check our <a href="https://documentation.opencollective.com">documentation</a>. We're here to help!
+</p>
+
+<p class="center">Cheers,</p>
+
+<p class="center">
+  <strong>– Team Open Collective</strong>
+</p>
+
+{{> footer}}

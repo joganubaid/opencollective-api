@@ -1,0 +1,78 @@
+/*
+ * Slack message sending logic
+ */
+
+import axios from 'axios';
+import config from 'config';
+
+import activitiesLib from '../lib/activities';
+
+import logger from './logger';
+import { reportErrorToSentry } from './sentry';
+import { isTrustedWebhookProviderUrl, toDiscordSlackCompatibleWebhookUrl } from './trusted-webhook-providers';
+
+export const OPEN_COLLECTIVE_SLACK_CHANNEL = {
+  ABUSE: 'abuse',
+  ENGINEERING_ALERTS: 'engineeringAlerts',
+};
+
+export default {
+  /*
+   * Post a given activity to a public channel (meaning scrubbed info only)
+   */
+  postActivityOnPublicChannel(activity, webhookUrl) {
+    const { message, options } = activitiesLib.formatMessageForPublicChannel(activity, 'slack');
+    return this.postMessage(message, webhookUrl, options);
+  },
+
+  /**
+   * Post a message on Open Collective's Slack. Channel must be a valid key of
+   * `config.slack.webhooks`. Use the `OPEN_COLLECTIVE_SLACK_CHANNEL` helper.
+   */
+  postMessageToOpenCollectiveSlack(message, channel, options = undefined) {
+    const webhookUrl = config.slack.webhooks[channel];
+    if (webhookUrl) {
+      return this.postMessage(message, webhookUrl, options);
+    } else if (typeof webhookUrl === 'undefined') {
+      logger.warn(`Unknown slack channel ${channel}`);
+    }
+  },
+
+  /*
+   * Posts a message to a slack webhook
+   */
+  async postMessage(msg, webhookUrl, options) {
+    if (!options) {
+      options = {};
+    }
+
+    const slackOptions = {
+      text: msg,
+      username: 'OpenCollective',
+      icon_url: 'https://opencollective.com/favicon.ico', // eslint-disable-line camelcase
+      attachments: options.attachments || [],
+    };
+
+    // production check
+    if (config.env !== 'production' && !process.env.TEST_SLACK) {
+      return;
+    }
+
+    if (!slackOptions.text) {
+      return;
+    }
+
+    const targetUrl = toDiscordSlackCompatibleWebhookUrl(webhookUrl);
+
+    try {
+      return await axios.post(targetUrl, slackOptions);
+    } catch (err) {
+      reportErrorToSentry(err, { extra: { targetUrl, slackOptions } });
+      throw err;
+    }
+  },
+
+  isSlackWebhookUrl(url) {
+    return isTrustedWebhookProviderUrl(url);
+  },
+};

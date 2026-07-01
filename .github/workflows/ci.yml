@@ -1,0 +1,443 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+env:
+  TZ: UTC
+  CI: true
+  OC_ENV: ci
+  NODE_ENV: test
+  AWS_KEY: user
+  AWS_SECRET: password
+  AWS_S3_BUCKET: opencollective-e2e
+  AWS_S3_REGION: us-east-1
+  AWS_S3_API_VERSION: latest
+  AWS_S3_ENDPOINT: http://localhost:9000
+  AWS_S3_SSL_ENABLED: false
+  AWS_S3_FORCE_PATH_STYLE: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+      - run: npm run lint:check
+
+  prettier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+      - run: npm run prettier:check
+
+  typescript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+      - run: npm run type:check
+
+  depcheck:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+      - run: npm run depcheck
+
+  ts-unused-exports:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Cache build
+        uses: actions/cache@v5
+        with:
+          path: dist
+          key: ${{ runner.os }}-api-build-${{ github.sha }}
+
+      - name: Check unused exports
+        run: npm run ts-unused-exports
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Cache build
+        uses: actions/cache@v5
+        with:
+          path: dist
+          key: ${{ runner.os }}-api-build-${{ github.sha }}
+
+      - name: Build
+        run: npm run build
+
+  test:
+    runs-on: ubuntu-24.04
+
+    timeout-minutes: 30
+    env:
+      PG_DATABASE: opencollective_test
+    services:
+      redis:
+        image: redis@sha256:027002f3d4161eb427643e0cc71023b582fb461c6199e699f46db843f0b39fb1
+        ports:
+          - 6379:6379
+        options: --entrypoint redis-server
+      postgres:
+        image: postgres:16.14@sha256:287eced1f33b59ed265ed13a60d3680dd7646d70c4dc0e785f59a470ebc03eeb
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      minio:
+        image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+        ports:
+          - 9000:9000
+        command: server /data
+        options: --name=minio --health-cmd "curl http://localhost:9000/minio/health/live"
+        env:
+          MINIO_ROOT_USER: user
+          MINIO_ROOT_PASSWORD: password
+          MINIO_BROWSER: 'off'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies+
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+      - run: npm run db:restore:test
+
+      - run: npm run test:coverage -- --ignore "test/server/graphql/**"
+
+      - name: Report coverage
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: Unit
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: Unit
+
+  test-graphql:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      PG_DATABASE: opencollective_test
+
+    services:
+      redis:
+        image: redis@sha256:027002f3d4161eb427643e0cc71023b582fb461c6199e699f46db843f0b39fb1
+        ports:
+          - 6379:6379
+        options: --entrypoint redis-server
+      postgres:
+        image: postgres:16.14@sha256:287eced1f33b59ed265ed13a60d3680dd7646d70c4dc0e785f59a470ebc03eeb
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      opensearch:
+        image: opensearchproject/opensearch:3@sha256:123e6591a47b1d54686890551bdb35739c85193ecded381219fc9e059e18128f
+        ports:
+          - 9200:9200
+        env:
+          discovery.type: single-node
+          DISABLE_INSTALL_DEMO_CONFIG: 'true'
+          DISABLE_SECURITY_PLUGIN: 'true'
+        options: >-
+          --health-cmd="curl --silent --fail http://localhost:9200/_cluster/health || exit 1"
+          --health-interval=10s
+          --health-timeout=15s
+          --health-retries=30
+      minio:
+        image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+        ports:
+          - 9000:9000
+        command: server /data
+        options: --name=minio --health-cmd "curl http://localhost:9000/minio/health/live"
+        env:
+          MINIO_ROOT_USER: user
+          MINIO_ROOT_PASSWORD: password
+          MINIO_BROWSER: 'off'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+      - run: npm run db:restore:test
+
+      - run: npm run test:coverage test/server/graphql
+
+      - name: Report coverage
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: GraphQL
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  schema-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      redis:
+        image: redis@sha256:027002f3d4161eb427643e0cc71023b582fb461c6199e699f46db843f0b39fb1
+        ports:
+          - 6379:6379
+        options: --entrypoint redis-server
+      postgres:
+        image: postgres:16.14@sha256:287eced1f33b59ed265ed13a60d3680dd7646d70c4dc0e785f59a470ebc03eeb
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: Restore node_modules
+        uses: actions/cache@v5
+        id: api-node-modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-api-node-modules-${{ hashFiles('package-lock.json') }}-${{ secrets.CACHE_VERSION }}
+
+      - name: Install dependencies
+        if: steps.api-node-modules.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+      - name: Generate & check schemas
+        run: ./scripts/check-schemas.sh
+
+  graphql-inspector:
+    name: GraphQL Inspector
+    runs-on: ubuntu-latest
+    # kamilkisiela/graphql-inspector@v3.4.0 is bundled for the Node 20 action runtime, which GitHub
+    # now force-runs on Node 24 (Node 20 deprecation), crashing the action. The action is
+    # unmaintained (no Node 24 build), so opt back into Node 20 until we replace or drop this job.
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+    services:
+      redis:
+        image: redis@sha256:027002f3d4161eb427643e0cc71023b582fb461c6199e699f46db843f0b39fb1
+        ports:
+          - 6379:6379
+        options: --entrypoint redis-server
+      postgres:
+        image: postgres:16.14@sha256:287eced1f33b59ed265ed13a60d3680dd7646d70c4dc0e785f59a470ebc03eeb
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: GraphQL Inspector (V1)
+        uses: kamilkisiela/graphql-inspector@c0ecb19ad21de709b80ed897041a4976c079c718 # v4.0.0
+        with:
+          name: 'GraphQL Inspector - Schema v1'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          schema: 'main:server/graphql/schemaV1.graphql'
+          fail-on-breaking: false
+
+      - name: GraphQL Inspector (V2)
+        uses: kamilkisiela/graphql-inspector@c0ecb19ad21de709b80ed897041a4976c079c718 # v4.0.0
+        with:
+          name: 'GraphQL Inspector - Schema v2'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          schema: 'main:server/graphql/schemaV2.graphql'
+          fail-on-breaking: false

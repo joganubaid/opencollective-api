@@ -1,0 +1,69 @@
+<style>
+  .expense-item-thumbnail-container {
+    width: 100%;
+    height: 100%;
+    z-index:0;
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+    background-image: url('{{config.host.website}}/static/images/link-icon.svg');
+  }
+</style>
+
+<h3 style="margin: 24px;">Expense items</h3>
+<table style="width: 100%;">
+  <tbody>
+    {{#each items}}
+      <tr>
+        {{#if this.url}}
+          <td style="width: 66px; border-bottom: 1px dotted rgb(196, 199, 204); padding: 12px 0;">
+            <div style="border: 1px solid #dcdee0; width: 48px; height: 48px; padding: 4px;">
+              <a href="{{this.url}}">
+                <div class="expense-item-thumbnail-container"></div>
+              </a>
+            </div>
+          </td>
+        {{/if}}
+        <td style="border-bottom: 1px dotted rgb(196, 199, 204); padding: 12px 0; padding-right: 10px;">
+          <p style="margin: 0; margin-bottom: 4px;">{{{this.description}}}</p>
+          <p style="margin: 0; color: #9D9FA3;">Date: {{moment this.incurredAt}}</p>
+        </td>
+        <td style="border-bottom: 1px dotted rgb(196, 199, 204); padding: 12px 10px;">
+          <p style="text-align: right;">
+            {{#ifCond this.currency '===' ../expense.currency}}
+              {{currency this.amount currency=this.currency}}
+            {{else}}
+              {{currency (multiply this.amount this.expenseCurrencyFxRate) currency=../expense.currency}}
+              <br>
+              <small>({{currency this.amount currency=this.currency}} x {{this.expenseCurrencyFxRate}})</small>
+            {{/ifCond}}
+          </p>
+        </td>
+      </tr>
+    {{/each}}
+    <tr>
+      <td colspan="2" style="padding: 12px 10px; text-align: right; color: #494B4D;font-size: 14px;line-height: 18px;">
+        {{! Taxes}}
+        {{#if expense.taxes.[0]}}
+          <div>
+            <div style="color: #494B4D;">
+              Subtotal ({{expense.currency}})&nbsp;&nbsp;
+              {{currency expense.grossAmount currency=expense.currency}}
+            </div>
+            {{#each expense.taxes}}
+              <div style="margin-top: 8px;">
+                {{this.type}} ({{multiply this.rate 100}}%)&nbsp;&nbsp;
+                {{currency (multiply ../expense.grossAmount this.rate) currency=../expense.currency}}
+              </div>
+            {{/each}}
+          </div>
+        {{/if}}
+        {{! Total amount}}
+        <div style="display: inline-block; margin-top: 12px; padding: 12px 0 12px 12px; border-top: 1px dotted rgb(196, 199, 204);">
+          <strong>Total Amount</strong>&nbsp;&nbsp;
+          <strong>{{currency expense.amount currency=expense.currency}}</strong>
+        </div>
+      </td>
+    </tr>
+  </tbody>
+</table>

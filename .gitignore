@@ -1,0 +1,50 @@
+lib-cov
+*.DS_Store
+*.seed
+*.log
+*.csv
+*.dat
+*.out
+*.pid
+*.gz
+
+node_modules
+coverage
+dbdumps/*
+!test/dbdumps/snapshots
+test-results.xml
+dist
+yarn.lock
+.nyc_output
+temp.js
+tempStripe.js
+
+.env
+.env.*
+.envrc
+
+!.env.development
+
+# IDE files
+jsconfig.json
+typings
+.gtm
+# VSCode
+.history
+.vscode
+.cursor
+# JetBrains
+.idea/
+*.iml
+
+# test artifacts
+output/
+!test/mocks/files/*.csv
+
+*.swp
+
+# Dev binaries
+scripts/dev/bin
+
+# Sentry Config File
+.sentryclirc

@@ -1,0 +1,47 @@
+Subject: Welcome to Open Collective!
+
+{{> header}}
+
+<h1>Hey {{collective.name}} 👋</h1>
+
+<p>We’d love to help you get your {{accountType}} up and running.</p>
+
+{{#if host}}
+
+<p>
+  {{#if hostPending}}
+  Your {{accountType}} is pending approval for Fiscal Hosting by (<a href="{{accountUrl host}}">{{host.name}}</a>).
+  Your Host will hold money on behalf of your {{accountType}}.
+  Once approved, your {{accountType}} will be able to receive money.
+  {{else}}
+  Your {{accountType}} is hosted by <a href="{{accountUrl host}}">{{host.name}}</a>, which will hold money on its behalf.
+  {{/if}}
+</p>
+
+{{else}}
+
+<p>
+In order to receive money, you need to specify where funds will be held. You should sign up with a <a href="https://opencollective.com/fiscal-hosting">Fiscal Host</a>, which will take care of things like accounting, banking, and tax reporting for you.
+</p>
+
+{{/if}}
+
+<p>There are lots of options and features to explore for your {{accountType}}, so <a href="{{config.host.website}}/dashboard/{{collective.slug}}">head to your settings</a> to customize your page and add team members.</p>
+
+<p>Check our <a href="https://documentation.opencollective.com/collectives/creating-a-collective">documentation</a> to learn more.</p>
+
+<p>Let us know if you need any help!</p>
+
+<p>
+  <center>
+    <a href="{{accountUrl collective}}" class="btn blue"><div>Get Started!</div></a>
+  </center>
+</p>
+
+<p>Feel free to reply to this email or <a href="https://discord.opencollective.com">join us on Discord</a>.</p>
+
+<p>Best,</p>
+
+<p>The Open Collective Team</p>
+
+{{> footer}}

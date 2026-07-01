@@ -1,0 +1,493 @@
+import config from 'config';
+import express from 'express';
+import { GraphQLBoolean, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLJSON } from 'graphql-scalars';
+import { omit } from 'lodash';
+
+import { activities } from '../../../constants';
+import { CollectiveType } from '../../../constants/collectives';
+import FEATURE from '../../../constants/feature';
+import POLICIES from '../../../constants/policies';
+import MemberRoles from '../../../constants/roles';
+import { checkFeatureAccess } from '../../../lib/allowed-features';
+import { purgeAllCachesForAccount, purgeCacheForCollective } from '../../../lib/cache';
+import emailLib from '../../../lib/email';
+import * as github from '../../../lib/github';
+import { OSCValidator, ValidatedRepositoryInfo } from '../../../lib/osc-validator';
+import { getPolicy } from '../../../lib/policies';
+import { stripHTML } from '../../../lib/sanitize-html';
+import { reportErrorToSentry } from '../../../lib/sentry';
+import twoFactorAuthLib from '../../../lib/two-factor-authentication';
+import models, { Collective, Op, sequelize } from '../../../models';
+import ConversationModel from '../../../models/Conversation';
+import HostApplication, { HostApplicationStatus } from '../../../models/HostApplication';
+import { processInviteMembersInput } from '../../common/members';
+import { checkRemoteUserCanUseAccount, checkRemoteUserCanUseHost, checkScope } from '../../common/scope-check';
+import { Forbidden, NotFound, ValidationFailed } from '../../errors';
+import { GraphQLProcessHostApplicationAction } from '../enum/ProcessHostApplicationAction';
+import { fetchAccountWithReference, GraphQLAccountReferenceInput } from '../input/AccountReferenceInput';
+import {
+  fetchHostApplicationWithReference,
+  GraphQLHostApplicationReferenceInput,
+} from '../input/HostApplicationReferenceInput';
+import { GraphQLInviteMemberInput } from '../input/InviteMemberInput';
+import { GraphQLAccount } from '../interface/Account';
+import GraphQLConversation from '../object/Conversation';
+import { GraphQLHostApplication } from '../object/HostApplication';
+
+const GraphQLProcessHostApplicationResponse = new GraphQLObjectType({
+  name: 'ProcessHostApplicationResponse',
+  fields: () => ({
+    account: {
+      type: new GraphQLNonNull(GraphQLAccount),
+      description: 'The account that applied to the host',
+    },
+    conversation: {
+      type: GraphQLConversation,
+      description: 'When sending a public message, this field will have the info about the conversation created',
+    },
+    hostApplication: {
+      type: GraphQLHostApplication,
+    },
+  }),
+});
+
+const HostApplicationMutations = {
+  applyToHost: {
+    type: new GraphQLNonNull(GraphQLAccount),
+    description: 'Apply to an host with a collective. Scope: "account".',
+    args: {
+      collective: {
+        type: new GraphQLNonNull(GraphQLAccountReferenceInput),
+        description: 'Account applying to the host.',
+      },
+      host: {
+        type: new GraphQLNonNull(GraphQLAccountReferenceInput),
+        description: 'Host to apply to.',
+      },
+      message: {
+        type: GraphQLString,
+        description: 'A message to attach for the host to review the application',
+      },
+      applicationData: {
+        type: GraphQLJSON,
+        description: 'Further information about collective applying to host',
+      },
+      inviteMembers: {
+        type: new GraphQLList(GraphQLInviteMemberInput),
+        description: 'A list of members to invite when applying to the host',
+      },
+    },
+    async resolve(_: void, args, req: express.Request): Promise<Collective> {
+      checkRemoteUserCanUseAccount(req);
+
+      const collective = await fetchAccountWithReference(args.collective);
+      if (!collective) {
+        throw new NotFound('Collective not found');
+      } else if (collective.isPrivate) {
+        throw new Forbidden('Private accounts cannot apply to hosts');
+      } else if (![CollectiveType.COLLECTIVE, CollectiveType.FUND].includes(collective.type)) {
+        throw new Error('Account must be a collective or a fund');
+      } else if (!req.remoteUser.isAdminOfCollective(collective)) {
+        throw new Forbidden('You need to be an Admin of the account');
+      }
+
+      await twoFactorAuthLib.enforceForAccount(req, collective);
+
+      const host = await fetchAccountWithReference(args.host);
+      if (!host) {
+        throw new NotFound('Host not found');
+      }
+
+      const isProd = config.env === 'production';
+
+      const where = {
+        CollectiveId: collective.id,
+        role: MemberRoles.ADMIN,
+      };
+      const [adminCount, adminInvitationCount] = await Promise.all([
+        models.Member.count({ where }),
+        models.MemberInvitation.count({ where }),
+      ]);
+      const minAdminsPolicy = await getPolicy(host, POLICIES.COLLECTIVE_MINIMUM_ADMINS);
+      const requiredAdmins = minAdminsPolicy?.numberOfAdmins ?? 0;
+      const validAdminsCount = adminCount + adminInvitationCount + (args.inviteMembers?.length || 0);
+      if (requiredAdmins > validAdminsCount) {
+        throw new Forbidden(`This host policy requires at least ${requiredAdmins} admins for this account.`);
+      }
+
+      let validatedRepositoryInfo: ValidatedRepositoryInfo,
+        shouldAutomaticallyApprove = false;
+
+      // Trigger Github validation when repository is on github.com
+      const repositoryUrl = args.applicationData?.repositoryUrl;
+      if (args.applicationData?.useGithubValidation) {
+        const githubHandle = github.getGithubHandleFromUrl(repositoryUrl);
+        try {
+          // For e2e testing, we enable testuser+(admin|member|host)@opencollective.com to create collective without github validation
+          const bypassGithubValidation = !isProd && req.remoteUser.email.match(/.*test.*@opencollective.com$/);
+          if (!bypassGithubValidation) {
+            const githubAccount = await models.ConnectedAccount.findOne({
+              where: { CollectiveId: req.remoteUser.CollectiveId, service: 'github' },
+            });
+            if (githubAccount) {
+              // In e2e/CI environment, checkGithubAdmin will be stubbed
+              await github.checkGithubAdmin(githubHandle, githubAccount.token);
+
+              if (githubHandle.includes('/')) {
+                validatedRepositoryInfo = OSCValidator(
+                  await github.getValidatorInfo(githubHandle, githubAccount.token),
+                );
+              }
+            }
+          }
+          shouldAutomaticallyApprove = Boolean(bypassGithubValidation);
+        } catch (error) {
+          throw new ValidationFailed(error.message);
+        }
+      }
+
+      if (repositoryUrl) {
+        collective.repositoryUrl = repositoryUrl;
+        await collective.save();
+      }
+
+      // No need to check the balance, this is being handled in changeHost, along with most other checks
+      const response = await collective.changeHost(host.id, req.remoteUser, {
+        shouldAutomaticallyApprove,
+        message: args.message,
+        applicationData: { ...args.applicationData, validatedRepositoryInfo },
+      });
+
+      if (args.inviteMembers && args.inviteMembers.length) {
+        await processInviteMembersInput(collective, args.inviteMembers, {
+          supportedRoles: [MemberRoles.ADMIN],
+          user: req.remoteUser,
+        });
+      }
+
+      return response;
+    },
+  },
+  processHostApplication: {
+    type: new GraphQLNonNull(GraphQLProcessHostApplicationResponse),
+    description: 'Reply to a host application. Scope: "host".',
+    args: {
+      account: {
+        deprecationReason: '2024-07-24: Please use hostApplication',
+        type: GraphQLAccountReferenceInput,
+        description: 'The account that applied to the host',
+      },
+      hostApplication: {
+        type: GraphQLHostApplicationReferenceInput,
+        description: 'The host application',
+      },
+      host: {
+        deprecationReason: '2024-07-24: Please use hostApplication',
+        type: GraphQLAccountReferenceInput,
+        description: 'The host concerned by the application',
+      },
+      action: {
+        type: new GraphQLNonNull(GraphQLProcessHostApplicationAction),
+        description: 'What to do with the application',
+      },
+      message: {
+        type: GraphQLString,
+        description: 'A message to attach as a reason for the action',
+      },
+    },
+    resolve: async (_, args, req: express.Request): Promise<Record<string, unknown>> => {
+      checkRemoteUserCanUseHost(req);
+
+      let hostApplication: HostApplication;
+      let account, host: Collective;
+      if (args.hostApplication) {
+        hostApplication = await fetchHostApplicationWithReference(args.hostApplication);
+        account = await hostApplication.getCollective();
+        host = await hostApplication.getHost();
+      } else {
+        account = await fetchAccountWithReference(args.account, { throwIfMissing: true });
+        host = await fetchAccountWithReference(args.host, { throwIfMissing: true });
+      }
+
+      if (!req.remoteUser.isAdmin(host.id)) {
+        throw new Forbidden('You need to be authenticated as a host admin to perform this action');
+      } else if (!args.hostApplication && account.HostCollectiveId !== host.id) {
+        // When using deprecated (account, host) args, collective must currently point to this host
+        throw new NotFound(`No application found for ${account.slug} in ${host.slug}`);
+      } else if (args.hostApplication && hostApplication.status !== HostApplicationStatus.PENDING) {
+        throw new ValidationFailed('This host application is no longer pending');
+      } else if (account.approvedAt) {
+        throw new ValidationFailed('This collective application has already been approved');
+      }
+
+      // Check feature access for RECEIVE_HOST_APPLICATIONS
+      await checkFeatureAccess(host, FEATURE.RECEIVE_HOST_APPLICATIONS, { loaders: req.loaders });
+
+      // Enforce 2FA
+      await twoFactorAuthLib.enforceForAccount(req, host, { onlyAskOnLogin: true });
+
+      switch (args.action) {
+        case 'APPROVE': {
+          const accountUpdated = await approveApplication(host, account, req);
+          return {
+            account: accountUpdated,
+            hostApplication: hostApplication ? await hostApplication.reload() : null,
+          };
+        }
+        case 'REJECT': {
+          const accountUpdated = await rejectApplication(host, account, req, args.message);
+          return {
+            account: accountUpdated,
+            hostApplication: hostApplication ? await hostApplication.reload() : null,
+          };
+        }
+        case 'SEND_PRIVATE_MESSAGE':
+          await sendPrivateMessage(host, account, args.message);
+          return { account, hostApplication: hostApplication ? await hostApplication.reload() : null };
+        case 'SEND_PUBLIC_MESSAGE':
+          return {
+            account,
+            conversation: await sendPublicMessage(host, account, req.remoteUser, args.message),
+            hostApplication: hostApplication ? await hostApplication.reload() : null,
+          };
+        default:
+          throw new ValidationFailed(`Action ${args.action} is not supported yet`);
+      }
+    },
+  },
+  removeHost: {
+    type: new GraphQLNonNull(GraphQLAccount),
+    description: 'Removes the host for an account',
+    args: {
+      account: {
+        type: new GraphQLNonNull(GraphQLAccountReferenceInput),
+        description: 'The account to unhost',
+      },
+      message: {
+        type: GraphQLString,
+        description: 'An optional HTML message to provide additional context to the action',
+      },
+      messageForContributors: {
+        type: GraphQLString,
+        description: 'An optional HTML message to provide additional context for contributors',
+      },
+      pauseContributions: {
+        type: new GraphQLNonNull(GraphQLBoolean),
+        description: 'If true, contributions will be paused rather than canceled',
+        defaultValue: true,
+      },
+    },
+    resolve: async (_, args, req: express.Request): Promise<Collective> => {
+      checkRemoteUserCanUseHost(req);
+
+      const account = await fetchAccountWithReference(args.account, { throwIfMissing: true });
+      if (account.ParentCollectiveId) {
+        throw new ValidationFailed(`Cannot unhost projects/events with a parent. Please unhost the parent instead.`);
+      }
+
+      const host = await req.loaders.Collective.host.load(account);
+      if (!host) {
+        return account;
+      }
+
+      const isHostAdmin = req.remoteUser.isAdminOfCollective(host);
+      const isAccountAdmin = req.remoteUser.isAdminOfCollective(account);
+      if (!isHostAdmin && !isAccountAdmin && !(req.remoteUser.isRoot() && checkScope(req, 'root'))) {
+        throw new Forbidden('Only the host admin or the account admin can trigger this action');
+      } else if (host.isPrivate && !isHostAdmin) {
+        throw new Forbidden('Only the host admin can trigger this action');
+      }
+
+      await twoFactorAuthLib.enforceForAccountsUserIsAdminOf(req, [account, host], { alwaysAskForToken: true });
+
+      await account.changeHost(null, req.remoteUser, {
+        pauseContributions: args.pauseContributions,
+        messageForContributors: args.messageForContributors,
+        messageSource: isHostAdmin ? 'HOST' : 'COLLECTIVE',
+      });
+
+      await models.Activity.create({
+        type: activities.COLLECTIVE_UNHOSTED,
+        UserId: req.remoteUser?.id,
+        UserTokenId: req.userToken?.id,
+        CollectiveId: account.id,
+        HostCollectiveId: host.id,
+        data: {
+          collective: account.info,
+          host: host.info,
+          message: args.message,
+          messageForContributors: args.messageForContributors,
+          pauseContributions: args.pauseContributions,
+          isHostAdmin,
+          isAccountAdmin,
+        },
+      });
+
+      await Promise.all([purgeAllCachesForAccount(account), purgeAllCachesForAccount(host)]);
+      return account.reload();
+    },
+  },
+};
+
+const approveApplication = async (host: Collective, collective: Collective, req: express.Request) => {
+  // Check minimum number of admins
+  const countAdminsWhere = {
+    CollectiveId: collective.id,
+    role: MemberRoles.ADMIN,
+  };
+
+  const [adminCount, adminInvitationCount] = await Promise.all([
+    models.Member.count({ where: countAdminsWhere }),
+    models.MemberInvitation.count({ where: countAdminsWhere }),
+  ]);
+
+  const minAdminsPolicy = await getPolicy(host, POLICIES.COLLECTIVE_MINIMUM_ADMINS);
+  if (minAdminsPolicy?.numberOfAdmins > adminCount + adminInvitationCount) {
+    throw new Forbidden(
+      `Your host policy requires at least ${minAdminsPolicy.numberOfAdmins} admins for this account.`,
+    );
+  }
+  // Run updates in a transaction to make sure we don't end up approving half accounts if something goes wrong
+  await sequelize.transaction(async transaction => {
+    const newAccountData = {
+      approvedAt: new Date(),
+      HostCollectiveId: host.id,
+      currency: host.currency,
+      isActive: true,
+    };
+
+    // Approve all non-archived events and projects created by this collective
+    await models.Collective.update(newAccountData, {
+      where: { ParentCollectiveId: collective.id, deactivatedAt: null },
+      hooks: false,
+      transaction,
+    });
+    await models.Collective.update(omit(newAccountData, ['isActive']), {
+      where: { ParentCollectiveId: collective.id, deactivatedAt: { [Op.not]: null } },
+      hooks: false,
+      transaction,
+    });
+
+    // Convert all active tiers to host currency
+    const children = await collective.getChildren({ attributes: ['id'], transaction });
+    await models.Tier.update(
+      { currency: host.currency },
+      {
+        validate: false,
+        transaction,
+        where: {
+          CollectiveId: [collective.id, ...children.map(c => c.id)],
+          currency: { [Op.not]: host.currency },
+        },
+      },
+    );
+
+    // Approve the collective
+    await collective.update(newAccountData, { transaction });
+
+    // If collective does not have enough admins, block it from receiving Contributions
+    const policy = await getPolicy(host, POLICIES.COLLECTIVE_MINIMUM_ADMINS, { transaction });
+    if (policy?.freeze && policy.numberOfAdmins > adminCount) {
+      await collective.disableFeature(FEATURE.RECEIVE_FINANCIAL_CONTRIBUTIONS, { transaction });
+    }
+
+    // Mark the application as approved
+    await models.HostApplication.updatePendingApplications(host, collective, HostApplicationStatus.APPROVED, {
+      transaction,
+    });
+  });
+
+  // Send a notification to collective admins
+  try {
+    await models.Activity.create({
+      type: activities.COLLECTIVE_APPROVED,
+      UserId: req.remoteUser?.id,
+      UserTokenId: req.userToken?.id,
+      CollectiveId: collective.id,
+      HostCollectiveId: host.id,
+      data: {
+        collective: collective.info,
+        host: host.info,
+        user: {
+          email: req.remoteUser?.email,
+        },
+      },
+    });
+  } catch (error) {
+    // Ignore failed notification activity
+    reportErrorToSentry(error, {
+      req,
+      extra: { host: host.info, collective: collective.info },
+    });
+  }
+
+  // Purge cache
+  purgeCacheForCollective(collective.slug);
+  return collective;
+};
+
+const rejectApplication = async (host, collective, req, reason: string) => {
+  if (collective.isActive) {
+    throw new Error('This application has already been approved');
+  }
+  const { remoteUser } = req;
+
+  // Reset host for collective & its children
+  if (collective.HostCollectiveId === host.id) {
+    await collective.changeHost(null, remoteUser);
+  }
+
+  // Notify collective admins
+  const cleanReason = reason && stripHTML(reason).trim();
+  await models.Activity.create({
+    type: activities.COLLECTIVE_REJECTED,
+    UserId: remoteUser.id,
+    UserTokenId: req.userToken?.id,
+    CollectiveId: collective.id,
+    HostCollectiveId: host.id,
+    data: {
+      collective: collective.info,
+      host: host.info,
+      user: {
+        email: remoteUser.email,
+      },
+      rejectionReason: cleanReason || null,
+    },
+  });
+
+  // Purge cache and change the status of the application
+  purgeCacheForCollective(collective.slug);
+  await models.HostApplication.updatePendingApplications(host, collective, HostApplicationStatus.REJECTED);
+  return collective;
+};
+
+const sendPrivateMessage = async (host, collective, message: string): Promise<void> => {
+  const adminUsers = await collective.getAdminUsers();
+  try {
+    await emailLib.send(
+      activities.HOST_APPLICATION_CONTACT,
+      config.email.noReply,
+      {
+        host: host.info,
+        collective: collective.info,
+        message,
+      },
+      {
+        bcc: adminUsers.map(u => u.email),
+        replyTo: host.data?.replyToEmail || undefined,
+      },
+    );
+  } catch (e) {
+    reportErrorToSentry(e, { extra: { host: host.info, collective: collective.info, message } });
+    throw new Error('Failed to send the contact message, please try again later');
+  }
+};
+
+const sendPublicMessage = async (host, collective, user, message: string): Promise<ConversationModel> => {
+  const title = `About your application to ${host.name}`;
+  const tags = ['host'];
+  return models.Conversation.createWithComment(user, collective, title, message, tags);
+};
+
+export default HostApplicationMutations;

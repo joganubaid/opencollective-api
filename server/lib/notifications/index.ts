@@ -1,0 +1,142 @@
+import axios, { AxiosError } from 'axios';
+import config from 'config';
+
+import { activities, channels } from '../../constants';
+import ActivityTypes from '../../constants/activities';
+import { Activity, Notification } from '../../models';
+import logger from '../logger';
+import { reportErrorToSentry, reportMessageToSentry } from '../sentry';
+import slackLib from '../slack';
+import { parseToBoolean } from '../utils';
+import {
+  enrichActivityForWebhookPayload,
+  getPinnedAxiosAgentsForWebhookUrl,
+  sanitizeActivityForWebhookPayload,
+  WebhookUrlNotAllowedError,
+} from '../webhooks';
+
+import { notifyByEmail } from './email';
+
+const shouldSkipActivity = (activity: Activity) => {
+  if (activity.type === ActivityTypes.COLLECTIVE_TRANSACTION_CREATED) {
+    if (parseToBoolean(config.activities?.skipTransactions)) {
+      return true;
+    } else if (!['CONTRIBUTION', 'ADDED_FUNDS'].includes(activity.data?.transaction?.kind)) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
+const publishToWebhook = async (notification: Notification, activity: Activity): Promise<boolean> => {
+  if (slackLib.isSlackWebhookUrl(notification.webhookUrl)) {
+    await slackLib.postActivityOnPublicChannel(activity, notification.webhookUrl);
+    return true;
+  } else {
+    const sanitizedActivity = sanitizeActivityForWebhookPayload(activity);
+    const enrichedActivity = enrichActivityForWebhookPayload(sanitizedActivity);
+    try {
+      const agents = await getPinnedAxiosAgentsForWebhookUrl(notification.webhookUrl);
+      const response = await axios.post(notification.webhookUrl, enrichedActivity, {
+        maxRedirects: 0,
+        timeout: 30000,
+        ...agents,
+      });
+      return response.status >= 200 && response.status < 300;
+    } catch (error) {
+      if (error instanceof WebhookUrlNotAllowedError) {
+        reportMessageToSentry(`Blocked webhook delivery to disallowed URL`, {
+          extra: { notification, activity },
+        });
+      }
+      // Silently fail, we ignore the fact that the webhook is not reachable
+      return false;
+    }
+  }
+};
+
+const dispatch = async (
+  activity: Activity,
+  { onlyChannels = null, force = false, onlyAwaitEmails = false } = {},
+): Promise<void> => {
+  const shouldNotifyChannel = channel => !onlyChannels || onlyChannels.includes(channel);
+
+  if (shouldNotifyChannel(channels.EMAIL)) {
+    try {
+      await notifyByEmail(activity);
+    } catch (e) {
+      if (!['ci', 'test', 'e2e'].includes(config.env)) {
+        reportErrorToSentry(e, {
+          extra: { activityId: activity.id, onlyChannels, force },
+        });
+      }
+    }
+  }
+
+  const dispatchToOtherChannels = async () => {
+    // process notification entries for slack, webhooks, etc...
+    if (!activity.CollectiveId || !activity.type) {
+      return;
+    }
+
+    if (shouldSkipActivity(activity) && !force) {
+      return;
+    }
+
+    // Some activities involve multiple collectives (eg. collective applying to a host)
+    const collectiveIdsToNotify = [activity.CollectiveId];
+    if (activity.type === activities.COLLECTIVE_APPLY) {
+      collectiveIdsToNotify.push(activity.data.host.id);
+    }
+
+    const where = {
+      CollectiveId: collectiveIdsToNotify,
+      type: [ActivityTypes.ACTIVITY_ALL, activity.type],
+      active: true,
+    };
+
+    const notificationChannels = await Notification.findAll({ where });
+    return Promise.all(
+      notificationChannels.map(async notifConfig => {
+        if (!shouldNotifyChannel(notifConfig.channel)) {
+          return;
+        }
+
+        try {
+          if (notifConfig.channel === channels.SLACK) {
+            await slackLib.postActivityOnPublicChannel(activity, notifConfig.webhookUrl);
+            notifConfig.recordSuccess(); // No need to await
+          } else if (notifConfig.channel === channels.WEBHOOK) {
+            // Send message to Webhook and ignore any failures
+            const success = await publishToWebhook(notifConfig, activity).catch(e => {
+              logger.error(`Error notifying webhook #${notifConfig.id} to ${notifConfig.webhookUrl}`);
+              logger.debug(e);
+            });
+            if (success) {
+              notifConfig.recordSuccess(); // No need to await
+            }
+          }
+        } catch (e) {
+          const stringifiedError =
+            e instanceof AxiosError ? `${e.response?.status} ${e.response?.statusText} ${e.config?.url}` : e;
+          if (e instanceof AxiosError) {
+            e.message = `Error sending Activity notification`;
+          }
+          reportErrorToSentry(e, {
+            tags: { notificationChannel: notifConfig.channel },
+            extra: { activity, notifConfig, onlyChannels, force, stringifiedError },
+          });
+        }
+      }),
+    );
+  };
+
+  if (onlyAwaitEmails) {
+    dispatchToOtherChannels();
+  } else {
+    await dispatchToOtherChannels();
+  }
+};
+
+export default dispatch;

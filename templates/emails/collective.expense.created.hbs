@@ -1,0 +1,36 @@
+Subject: New expense on {{{collective.name}}}: {{currency expense.amount currency=expense.currency}} for {{{escapeForSubject expense.description}}}
+
+{{> header}}
+
+<center>
+  <h1><a href="{{permalink expense}}">{{currency expense.amount currency=expense.currency}}</a></h1>
+  <div>
+    <a href="{{permalink expense}}">{{expense.description}}</a>
+  </div>
+  <div>
+    Payee: <a href="{{accountUrl fromCollective}}"> {{fromCollective.name}} </a>
+  </div>
+  <div>
+    Submitted by: <a href="{{accountUrl user}}"> {{user.name}} </a>
+  </div>
+  {{#if payoutMethod}}
+    {{#ifCond payoutMethod.type '===' 'PAYPAL'}}
+      <div>Paypal Email: {{payoutMethod.data.email}}</div>
+    {{/ifCond}}
+  {{/if}}
+
+  <p><font color="#999">{{expense.notes}}</font></p>
+
+  {{> expenseItems items=items}}
+
+  <br />
+  <br />
+  <br />
+  <a class="btn blue" href="{{permalink expense}}">
+    <div>View</div>
+  </a>
+
+  <br /><br />
+</center>
+
+{{> footer}}

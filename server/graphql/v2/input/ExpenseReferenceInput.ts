@@ -1,0 +1,122 @@
+import { GraphQLInputFieldConfig, GraphQLInputObjectType, GraphQLInt, GraphQLString } from 'graphql';
+import { uniq } from 'lodash';
+import { Includeable, Op } from 'sequelize';
+
+import { EntityShortIdPrefix, isEntityPublicId } from '../../../lib/permalink/entity-map';
+import models from '../../../models';
+import Expense from '../../../models/Expense';
+import { NotFound } from '../../errors';
+import { Loaders } from '../../loaders';
+import { idDecode, IDENTIFIER_TYPES } from '../identifiers';
+
+export interface ExpenseReferenceInputFields {
+  id?: string;
+  legacyId?: number;
+}
+
+const GraphQLExpenseReferenceInput = new GraphQLInputObjectType({
+  name: 'ExpenseReferenceInput',
+  fields: (): Record<keyof ExpenseReferenceInputFields, GraphQLInputFieldConfig> => ({
+    id: {
+      type: GraphQLString,
+      description: `The public id identifying the expense (ie: dgm9bnk8-0437xqry-ejpvzeol-jdayw5re, ${EntityShortIdPrefix.Expense}_xxxxxxxx)`,
+    },
+    legacyId: {
+      type: GraphQLInt,
+      description: 'The internal id of the expense (ie: 580)',
+      deprecationReason: '2026-02-25: use id',
+    },
+  }),
+});
+
+const getDatabaseIdFromExpenseReference = async (
+  input: ExpenseReferenceInputFields,
+  { loaders = null } = {},
+): Promise<number | null> => {
+  if (isEntityPublicId(input.id, EntityShortIdPrefix.Expense)) {
+    return (
+      loaders
+        ? loaders.Expense.byPublicId.load(input.id)
+        : models.Expense.findOne({ where: { publicId: input.id }, attributes: ['id'] })
+    ).then(expense => {
+      if (!expense) {
+        throw new NotFound(`Expense with public id ${input.id} not found`);
+      }
+      return expense.id;
+    });
+  } else if (input['id']) {
+    return idDecode(input['id'], IDENTIFIER_TYPES.EXPENSE);
+  } else if (input['legacyId']) {
+    return <number>input['legacyId'];
+  } else {
+    return null;
+  }
+};
+
+/**
+ * Retrieve an expense from an `ExpenseReferenceInput`
+ */
+const fetchExpenseWithReference = async (
+  input: ExpenseReferenceInputFields,
+  { loaders = null, throwIfMissing = false }: { loaders?: Loaders; throwIfMissing?: boolean } = {},
+): Promise<Expense> => {
+  let expense: Expense | null = null;
+  if (isEntityPublicId(input.id, EntityShortIdPrefix.Expense)) {
+    expense = await (loaders
+      ? loaders.Expense.byPublicId.load(input.id)
+      : Expense.findOne({ where: { publicId: input.id } }));
+  } else {
+    const dbId = await getDatabaseIdFromExpenseReference(input, { loaders });
+    if (dbId) {
+      expense = await (loaders ? loaders.Expense.byId.load(dbId) : models.Expense.findByPk(dbId));
+    }
+  }
+
+  if (!expense && throwIfMissing) {
+    throw new NotFound();
+  }
+
+  return expense;
+};
+
+/**
+ * Retrieve expenses from a list of expense reference inputs.
+ *
+ * This does not use a graphql loader, careful to use for a list
+ * @param inputs
+ * @returns
+ */
+const fetchExpensesWithReferences = async (
+  inputs: ExpenseReferenceInputFields[],
+  opts: { throwIfMissing?: boolean; include?: Includeable; loaders?: Loaders } = {},
+): Promise<Expense[]> => {
+  if (inputs.length === 0) {
+    return [];
+  }
+
+  const ids = uniq(
+    await Promise.all(inputs.map(input => getDatabaseIdFromExpenseReference(input, { loaders: opts?.loaders }))),
+  );
+
+  const where: { [key: string]: unknown } & { [Op.or]?: unknown } = {};
+  if (ids.length) {
+    where.id = ids;
+  }
+
+  const expenses = await models.Expense.findAll({ where, include: opts.include });
+
+  // Check if all expenses were found
+  if (opts.throwIfMissing && ids.length !== expenses.length) {
+    const missingExpenseIds = ids.filter(id => !expenses.find(expense => expense.id === id));
+    throw new NotFound(`Could not find expenses with ids: ${missingExpenseIds.join(', ')}`);
+  }
+
+  return expenses;
+};
+
+export {
+  GraphQLExpenseReferenceInput,
+  fetchExpenseWithReference,
+  fetchExpensesWithReferences,
+  getDatabaseIdFromExpenseReference,
+};

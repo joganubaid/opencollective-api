@@ -1,0 +1,107 @@
+import './env';
+import './lib/sentry/init';
+import './open-telemetry';
+
+import { AddressInfo } from 'net';
+import os from 'os';
+
+import * as Sentry from '@sentry/node';
+import config from 'config';
+import express from 'express';
+
+import setupExpress from './lib/express';
+import logger from './lib/logger';
+import { createRedisClient, RedisInstanceType } from './lib/redis';
+import { reportErrorToSentry } from './lib/sentry';
+import { updateCachedFidoMetadata } from './lib/two-factor-authentication/fido-metadata';
+import { parseToBoolean } from './lib/utils';
+import { startExportWorker } from './workers/exports';
+import { startSearchSyncWorker } from './workers/search-sync';
+import { sequelize } from './models';
+import routes from './routes';
+
+async function startExpressServer(workerId) {
+  const expressApp = express();
+
+  await updateCachedFidoMetadata();
+  const redisClient = await createRedisClient(RedisInstanceType.SESSION);
+  setupExpress(expressApp, redisClient);
+
+  /**
+   * Routes.
+   */
+  await routes(expressApp);
+
+  Sentry.setupExpressErrorHandler(expressApp);
+
+  /**
+   * Start server
+   */
+  const server = expressApp.listen(config.port, () => {
+    const host = os.hostname();
+    logger.info(
+      'Open Collective API listening at http://%s:%s in %s environment. Worker #%s',
+      host,
+      (server.address() as AddressInfo).port,
+      config.env,
+      workerId,
+    );
+  });
+  server.on('error', error => {
+    logger.error('Failed to start Express server', error);
+    reportErrorToSentry(error);
+  });
+
+  server.timeout = 25000; // sets timeout to 25 seconds
+  expressApp['__server__'] = server;
+
+  return expressApp;
+}
+
+// Start the express server
+let appPromise: Promise<express.Express> | undefined;
+if (parseToBoolean(config.services.server)) {
+  appPromise = startExpressServer(1);
+}
+
+// Start the search sync job
+const pStopSearchSyncWorker = startSearchSyncWorker();
+const pStopExportWorker = startExportWorker();
+
+let isShuttingDown = false;
+const gracefullyShutdown = async signal => {
+  if (!isShuttingDown) {
+    logger.info(`Received ${signal}. Shutting down.`);
+    isShuttingDown = true;
+
+    const stopSearchSyncWorker = await pStopSearchSyncWorker;
+    if (stopSearchSyncWorker) {
+      await stopSearchSyncWorker();
+    }
+    const stopExportWorker = await pStopExportWorker;
+    if (stopExportWorker) {
+      await stopExportWorker();
+    }
+
+    if (appPromise) {
+      await appPromise.then(app => {
+        if (app['__server__']) {
+          logger.info('Closing express server');
+          app['__server__'].close();
+        }
+      });
+    }
+
+    await sequelize.close();
+    process.exit();
+  }
+};
+
+process.on('exit', () => gracefullyShutdown('exit'));
+process.on('SIGINT', () => gracefullyShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefullyShutdown('SIGTERM'));
+
+// This is used by tests
+export default async function startServerForTest() {
+  return appPromise ?? startExpressServer(1);
+}

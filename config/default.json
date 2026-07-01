@@ -1,0 +1,309 @@
+{
+  "port": "3060",
+  "services": {
+    "server": true,
+    "searchSync": false
+  },
+  "mailpit": {
+    "client": false,
+    "smtpPort": 1025,
+    "host": "127.0.0.1"
+  },
+  "database": {
+    "url": "postgres://opencollective@127.0.0.1:5432/opencollective_dvl",
+    "options": {
+      "pool": {
+        "min": 5,
+        "max": 10,
+        "acquire": 1200000
+      },
+      "logging": false,
+      "benchmark": true,
+      "dialectOptions": {
+        "application_name": "opencollective-api"
+      }
+    },
+    "readOnly": false
+  },
+  "opensearch": {
+    "maxSyncDelay": 5000
+  },
+  "platform": {},
+  "maintenancedb": {
+    "url": "postgres://postgres@127.0.0.1:5432/postgres"
+  },
+  "keys": {
+    "opencollective": {
+      "apiKey": "dvl-1510egmf4a23d80342403fb599qd",
+      "sessionSecret": "mei0ieD3ahli9fengie7teeceeCaicho",
+      "jwtSecret": "vieneixaGhahk2aej2pohsh2aeB1oa6o",
+      "emailUnsubscribeSecret": "vieneixaGhahk2aej2pohsh2aeB1oa6o",
+      "hashidSalt": "aiwiurohyohleevoo4ohraigi3auTohz"
+    }
+  },
+  "host": {
+    "api": "http://localhost:3060",
+    "website": "http://localhost:3000",
+    "images": "https://images-staging.opencollective.com",
+    "pdf": "https://pdf-staging.opencollective.com",
+    "rest": "https://rest-staging.opencollective.com",
+    "ml": "http://ml.opencollective.com"
+  },
+  "fees": {
+    "default": {
+      "hostPercent": 0,
+      "platformPercent": 0
+    }
+  },
+  "limits": {
+    "taxForms": {
+      "downloadPerHour": 15
+    },
+    "ordersPerHour": {
+      "perAccount": 10,
+      "perAccountForCollective": 2,
+      "perEmail": 10,
+      "perEmailForCollective": 2,
+      "perIp": 5,
+      "perMask": 5,
+      "forCollective": 10
+    },
+    "giftCards": {
+      "maxPerDay": 100
+    },
+    "klippa": {
+      "perUser": {
+        "month": 100,
+        "week": 50,
+        "day": 30,
+        "hour": 15
+      }
+    },
+    "changeEmailPerHour": {
+      "update": 10,
+      "confirmToken": 15
+    },
+    "setPasswordPerUserPerHour": 10,
+    "confirmEmailPerIpPerHour": 10,
+    "skipCleanOrdersLimitSlugs": "",
+    "enabledMasks": "",
+    "sendGuestConfirmPerMinutePerEmail": 1,
+    "sendGuestConfirmPerMinutePerIp": 2,
+    "confirmGuestAccountPerMinutePerIp": 5,
+    "maxNumberOfAppsPerUser": 15,
+    "maxWebhooksPerUserPerCollective": 50,
+    "webhookUrlValidationPerUserPerHour": 30,
+    "search": {
+      "global": {
+        "perMinutePerUser": 75,
+        "perMinutePerIp": 15
+      },
+      "email": {
+        "perHourPerUser": 150,
+        "perHourPerIp": 50
+      },
+      "concurrentRequests": 10
+    },
+    "userSigninAttemptsPerHourPerIp": 50,
+    "userSignUpPerHour": 3,
+    "userExchangeLoginTokenPerHourPerIp": 50,
+    "userRefreshTokenPerHourPerIp": 50,
+    "collectiveEmailMessagePerHour": 5,
+    "maxCoreContributorsPerAccount": 60,
+    "transactionsImports": {
+      "perHourPerUser": 30,
+      "rowsPerHourPerUser": 10000
+    }
+  },
+  "email": {
+    "from": "Open Collective <info@opencollective.com>",
+    "noReply": "Open Collective <no-reply@opencollective.com>"
+  },
+  "log": {
+    "level": "info",
+    "accessLogs": false,
+    "slowRequest": false,
+    "slowRequestThreshold": 1000,
+    "slowMiddleware": false,
+    "slowMiddlewareThreshold": 1000
+  },
+  "aws": {
+    "s3": {
+      "bucket": "opencollective-test",
+      "region": "us-west-1",
+      "apiVersion": "2006-03-01",
+      "sslEnabled": true
+    }
+  },
+  "klippa": {
+    "apiKey": null,
+    "enabled": true
+  },
+  "paypal": {
+    "payment": {
+      "environment": "sandbox"
+    },
+    "connect": {
+      "clientId": null,
+      "clientSecret": null,
+      "redirectUri": null
+    }
+  },
+  "github": {
+    "clientID": "UNDEFINED_GITHUB_CLIENT_ID",
+    "clientSecret": "UNDEFINED_GITHUB_CLIENT_SECRET"
+  },
+  "stripe": {
+    "accountId": "acct_15vekcDjPFcHOcTm",
+    "clientId": "ca_68FQcZXEcV66Kjg7egLnR1Ce87cqwoue",
+    "key": "pk_test_VgSB4VSg2wb5LdAkz7p38Gw8",
+    "secret": "sk_test_dummy_key_value_bypass_12345",
+    "redirectUri": "http://localhost:3000/services/stripe/oauth/callback",
+    "paymentIntentEnabled": false,
+    "oneTimePaymentMethodConfiguration": "pmc_1PIqlVDjPFcHOcTmtPfRrO8O",
+    "recurringPaymentMethodConfiguration": "pmc_1PIrrBDjPFcHOcTmG196DTXL"
+  },
+  "slack": {
+    "webhooks": {
+      "abuse": null
+    }
+  },
+  "captcha": {
+    "enabled": false
+  },
+  "recaptcha": {
+    "siteKey": "6LcyeXoUAAAAAFtdHDZfsxncFUkD9NqydqbIFcCK",
+    "secretKey": "6LcyeXoUAAAAACqNaR6EZJ_LG0V0N35uNkab3ibj"
+  },
+  "hcaptcha": {
+    "secret": "0x0000000000000000000000000000000000000000"
+  },
+  "taxForms": {
+    "encryptionKey": "Pz/LnMPzhxQqsbXZ0SCb3sP0uhw8dCxspoAXLXO4CV8=",
+    "aws": {
+      "s3": {
+        "bucket": "opencollective-tax-forms-test"
+      }
+    }
+  },
+  "githubFlow": {
+    "minNbStars": 100
+  },
+  "transferwise": {
+    "apiUrl": "https://api.wise-sandbox.com",
+    "oauthUrl": "https://wise-sandbox.com",
+    "clientId": "opencollective",
+    "clientKey": "opencollective",
+    "clientSecret": "4C08C79F-44B4-461E-8997-BF9DCC20101F",
+    "redirectUri": "http://localhost:3000/services/transferwise/oauth/callback",
+    "privateKey": "LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFb3dJQkFBS0NBUUVBdGZVdUVBbnhMV3prS3RoWG9jeFdhNzRhanoxSTI4bFRSeWhQSE5CVmdEU0tCdFltCnRjQUQ2alhtWWZXcEo1THNud2thSk9sbDF2TmNxeVdkZmVPSkViS2dvQjZGbzQyQ3ZpNDNVN21HTG5KeGRHOVUKdENnekJWbFI4UjV6UnUvYmZZSzNISmxJTnNscnlKalZyOEJ3R3NweUVMd2NmMXUraUt2VDVKUFIxSHpVV2R5UgpFc0w5a1YrRUJDbXJDaVk3SHRrV2ZxNzU1Q2NNRFJPUXl1ZlhPbjNHYjh4SWJQSllHdmtTamVGQW50dE4wOTZ5CjBLTGNid1dFa25ESysweUJxWFdZOXZKWEJCekRVMGsyQTJjZTFaQ3dYMkREQUVhOU1LbHYvbXNadFpxQmRzcHIKYWtaOHR2Q2RHN1dPMW1mNFdGSmx0M0dYMTJ2M2pqQ3NvSWNaY1FJREFRQUJBb0lCQUhPSGY3NnBRVnR4TnhISgpHU0xmQmNRVkNQSUhuRm9JWXZyY0toY0daRE1wcUxXY2hTbURDRGxPRGNBRzVXYitENFVPbDIzMlR6WUNnTVVkCjlmZzNYeEZBbEdIMTN5NHdMR0lxSC9EbDY3OVQ1SnRrRUtqdW1TNTlQdHpVVTZjbnBmbno0K1dob1VzLzZsS00KVDZqdWkzOUhLTk5kVE03RVpwNktVdGhmenF1Vm55M210T1RjeWU2UUVueFhFSGd5RGdnaVlvY1lmcHVxbGhreQpBWUU2WmVOVEZtM3pYZjl0dHlsUkZ3VC9mcUVMUC9ldk5OdkpNbDErUGJmVTlidUVmdUFiRDByRHowUjdRaHJtCmI1dEtjSEJrdk5MSmpWbU92Y1NPbC9yVkFqSThPWXdGcXphTGxXWHdTaTNVcFc4Z05EazlpODB4bWxYK0RnZXkKaFk4NHNnRUNnWUVBN2hkRVpuYVJrSkI5aSt5aHVrZHNKdXUveWEvNHhweFhHUmZ3TFpGTzN4ZDY4QXdscTh1VgpUblFpWkVhcitZeGdJSjJGK1JWUXVhSDFkMmU3bEg1VkRwaHp4dEQvcEg0c2hzWTNyS3VpdXlWWkRGR1BJeFBBCjVWd0FoSWkvTmIwRUNqZGFGVWY3OWdkN082c3hxSnN3ZUdKQXl6STBWOXN3bDNKQktHdGNlV0VDZ1lFQXc2VC8KOWpoeFpFVnkrNWNKM1R6eGtnM3NyNnV4Y2t2MUsrS3BtQTE3QnBWNUtKQndzMFArTXBhZ1BtNG1CQ25hcTltWQpPMFhjd2I3YWZyeUJVTDR0d0xFQ0hySDZZeTZ3eVBzSzBLMzBDOUUxNnJpbXY4RThPVC9Qa2lPYys4ZFVtNDZECkQvZHhNWE1HOWJuSWVHalJ1OXpWY21wdWVndllCM3pvM3RadFNoRUNnWUJLemphb2R0SnZlR1pwd3pSaEliV2kKV09uT1JhTEZURE8xWjZjSHVpTHN4eVRTTFE3YzlqNzRBbGNYNkhoNkZKZlRSNHJqWXNZVlBRU3h1bjdlUGY4ZApjZHJXZWE0SWtiZ050Rk9qeGQyQUxWRFlKUHZ6Q203TjRXVXNQd2JNckpHTFlDN0dodkpzTDVlUmZNMUNhMWdFClN1S090VHhxNml4UE9RK3QwbVdnb1FLQmdRREJNbFhsQWRYUHE5a2c0d1RGcVdIdjFicE51MkZ1T2Qzd3FWTEsKS1QyOHdhdzBSM1pUUUNoc01sd3Bha0kyU0ZKODgxSWw3aFpTYUxLQkJvczRmYVRXckxVb05KN0toSmZrMENyYwo2WHFlbE1rR2NiT1FsalJ2WURrTTJnZ3loYU5pUFhmbE0zZGUyblVjQUlzYmhIN2dZZkdSbTlKZXlRVmFWNW5xCk81c08wUUtCZ0N0MU5SV012MC9hVnNNT1UrTFpKY1N0dGtuY01hMkx4SjdHSEtsZFhQVjlIZEh6d3IrTXE4ZlQKSXdMdUtMcERhZHZJeHZha212MXJlYjlaaUtCOWxLeHk0KzMxNFdOV2Fnd3p6V25JTGNEbVRQRlcwdHNIZ251bgoveDEzNDZUeDJRWFhncnJCdlNwNHBURWhUVUZ0VnVjM0ZYUFR5ODkvTHVGcTdENjAwRUd2Ci0tLS0tRU5EIFJTQSBQUklWQVRFIEtFWS0tLS0tCg==",
+    "blockedCurrencies": "NGN, CUC, CUP, IRR, KPW, SDG, SYP, VED, VES, AFN, BIF, XAF, CDF, ERN, IQD, LYD, SOS, SSP, MMK, YER, RUB, BYN",
+    "blockedCurrenciesForBusinessProfiles": "PKR",
+    "recipientTypesBlockedForBusinessProfiles": "chinese_wechatpay",
+    "blockedCurrenciesForNonProfits": "INR",
+    "currenciesThatRequireReference": "RUB",
+    "blockedCountries": "SS, SD, BI, CF, TD, CG, CD, SO, CU, IR, VE, SY, KP, AF, ER, IQ, LY, MM, YE, RU, BY",
+    "useTransferRefundHandler": false,
+    "useSimplifiedQuote": true
+  },
+  "hyperwatch": {
+    "enabled": false,
+    "path": "/_hyperwatch",
+    "realm": null,
+    "username": "opencollective"
+  },
+  "dbEncryption": {
+    "secretKey": "guineapigs",
+    "cipher": "DES"
+  },
+  "graphql": {
+    "cache": {
+      "enabled": false,
+      "ttl": 300,
+      "minExecutionTimeToCache": 200
+    },
+    "error": {
+      "detailed": false
+    },
+    "resolverTimeDebugWarning": 200
+  },
+  "pdfService": {
+    "fetchTransactionsReceipts": false
+  },
+  "activities": {
+    "skipTransactions": false
+  },
+  "restService": {
+    "fetchCollectiveTransactionsCsv": false,
+    "fetchHostTransactionsCsv": false
+  },
+  "sentry": {
+    "tracesSampleRate": 0,
+    "profilesSampleRate": 0,
+    "minExecutionTimeToSample": 800
+  },
+  "ledger": {
+    "fastBalance": true,
+    "separatePaymentProcessorFees": false,
+    "separateTaxes": false,
+    "orderedTransactions": false
+  },
+  "timeline": {
+    "daysCached": 7,
+    "disabled": false
+  },
+  "twoFactorAuthentication": {
+    "enabled": true
+  },
+  "fraud": {
+    "order": {
+      "user": "[[\"1 month\", 10, 0.8, 0.8], [\"1 month\", 5, 1, 1]]",
+      "card": "[[\"1 month\", 10, 0.8, 0.2], [\"1 month\", 5, 1, 0.5]]",
+      "email": "[[\"5 days\", 10, 0.8, 0.8], [\"5 days\", 5, 1, 1]]",
+      "ip": "[[\"5 day\", 10, 0.8, 0.8]]"
+    },
+    "enforceSuspendedAsset": true
+  },
+  "virtualCards": {
+    "maximumLimitForInterval": {
+      "PER_AUTHORIZATION": 5000,
+      "DAILY": 5000,
+      "WEEKLY": 5000,
+      "MONTHLY": 5000,
+      "YEARLY": 5000,
+      "ALL_TIME": 5000
+    }
+  },
+  "gitbook": {
+    "apiUrl": "https://api.gitbook.com",
+    "apiKey": "UNDEFINED_GITBOOK_API_KEY",
+    "spaceId": "NDB6a9zS8ZMISyZwm7K9"
+  },
+  "opentelemetry": {
+    "enabled": false
+  },
+  "plaid": {
+    "env": "sandbox"
+  },
+  "webauthn": {
+    "rpName": "[Test] Open Collective",
+    "rpId": "localhost",
+    "expectedOrigins": ["http://localhost:3000"]
+  },
+  "features": {
+    "newPricing": false
+  },
+  "performance": {
+    "hostsWithManyTransactions": [],
+    "collectivesWithManyTransactions": []
+  },
+  "settlement": {
+    "minimumAmountInUSD": 1000
+  },
+  "exports": {
+    "expirationDays": {
+      "TRANSACTIONS": 90,
+      "HOSTED_COLLECTIVES": 90
+    }
+  }
+}

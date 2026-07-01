@@ -1,0 +1,75 @@
+{
+  "database": {
+    "options": {
+      "logging": true,
+      "pool": {
+        "min": 4,
+        "max": 10,
+        "acquire": 60000
+      },
+      "dialectOptions": {
+        "ssl": {
+          "rejectUnauthorized": false
+        }
+      }
+    }
+  },
+  "opensearch": {
+    "indexesPrefix": "staging"
+  },
+  "host": {
+    "api": "https://api-staging.opencollective.com",
+    "frontend": "https://frontend-staging.opencollective.com",
+    "images": "https://images-staging.opencollective.com",
+    "website": "https://staging.opencollective.com",
+    "ml": "https://ml.opencollective.com",
+    "webhooks": "https://api-staging.opencollective.com/webhooks"
+  },
+  "log": {
+    "slowRequest": true
+  },
+  "stripe": {
+    "redirectUri": "https://staging.opencollective.com/services/stripe/oauth/callback"
+  },
+  "transferwise": {
+    "redirectUri": "https://staging.opencollective.com/services/transferwise/oauth/callback"
+  },
+  "paypal": {
+    "connect": {
+      "redirectUri": "https://staging.opencollective.com/services/paypal/oauth/callback"
+    }
+  },
+  "githubFlow": {
+    "minNbStars": 0
+  },
+  "pdfService": {
+    "fetchTransactionsReceipts": true
+  },
+  "sentry": {
+    "tracesSampleRate": 0.01,
+    "profilesSampleRate": 0.02
+  },
+  "restService": {
+    "fetchCollectiveTransactionsCsv": true,
+    "fetchHostTransactionsCsv": true
+  },
+  "graphql": {
+    "cache": {
+      "enabled": true
+    }
+  },
+  "limits": {
+    "ordersPerHour": {
+      "perAccount": 300,
+      "perAccountForCollective": 300,
+      "perEmail": 300,
+      "perEmailForCollective": 300,
+      "perIp": 300
+    }
+  },
+  "webauthn": {
+    "rpName": "[Staging] Open Collective",
+    "rpId": "staging.opencollective.com",
+    "expectedOrigins": ["https://staging.opencollective.com"]
+  }
+}

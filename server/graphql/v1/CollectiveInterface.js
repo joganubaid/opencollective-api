@@ -1,0 +1,1548 @@
+import {
+  GraphQLBoolean,
+  GraphQLEnumType,
+  GraphQLFloat,
+  GraphQLInt,
+  GraphQLInterfaceType,
+  GraphQLList,
+  GraphQLNonNull,
+  GraphQLObjectType,
+  GraphQLString,
+} from 'graphql';
+import { GraphQLJSON } from 'graphql-scalars';
+import { get, has, isNil, isNull, merge, omitBy } from 'lodash';
+
+import { CollectiveType as CollectiveTypeEnum } from '../../constants/collectives';
+import FEATURE from '../../constants/feature';
+import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../constants/paymentMethods';
+import MemberRoles, { MemberRolesForPrivateAccounts } from '../../constants/roles';
+import { hasFeature } from '../../lib/allowed-features';
+import { isCollectiveDeletable } from '../../lib/collectivelib';
+import { filterContributors } from '../../lib/contributors';
+import logger from '../../lib/logger';
+import queries from '../../lib/queries';
+import { canSeeLegalName } from '../../lib/user-permissions';
+import models, { Op } from '../../models';
+import Tier, { AllTierTypes } from '../../models/Tier';
+import { hostResolver } from '../common/collective';
+import { GraphQLCollectiveFeatures } from '../common/CollectiveFeatures';
+import { getContextPermission, PERMISSION_TYPE } from '../common/context-permissions';
+import { idEncode, IDENTIFIER_TYPES } from '../v2/identifiers';
+import { GraphQLPolicies } from '../v2/object/Policies';
+import { GraphQLSocialLink } from '../v2/object/SocialLink';
+
+import {
+  ConnectedAccountType,
+  ContributorRoleEnum,
+  ContributorType,
+  DateString,
+  LocationType,
+  MemberType,
+  NotificationType,
+  OrderStatusType,
+  OrderType,
+  PaginatedPaymentMethodsType,
+  PaymentMethodBatchInfo,
+  PaymentMethodType,
+  TierType,
+} from './types';
+
+export const TypeOfCollectiveType = new GraphQLEnumType({
+  name: 'TypeOfCollective',
+  values: {
+    COLLECTIVE: {},
+    EVENT: {},
+    ORGANIZATION: {},
+    USER: {},
+    BOT: {},
+    PROJECT: {},
+    FUND: {},
+    VENDOR: {},
+  },
+});
+
+const BackersStatsType = new GraphQLObjectType({
+  name: 'BackersStatsType',
+  description: 'Breakdown of backers per type (ANY/USER/ORGANIZATION/COLLECTIVE)',
+  fields: () => {
+    return {
+      // We always have to return an id for apollo's caching
+      id: {
+        type: GraphQLInt,
+        resolve(stats) {
+          return stats.id;
+        },
+      },
+      all: {
+        description: 'Total number of backers that have given money to this collective',
+        type: GraphQLInt,
+        resolve(stats) {
+          return stats.all;
+        },
+      },
+      users: {
+        description: 'Number of individuals that have given money to this collective',
+        type: GraphQLInt,
+        resolve(stats) {
+          return stats.USER || 0;
+        },
+      },
+      organizations: {
+        description: 'Number of organizations that have given money to this collective',
+        type: GraphQLInt,
+        resolve(stats) {
+          return stats.ORGANIZATION || 0;
+        },
+      },
+      collectives: {
+        description: 'Number of collectives that have given money to this collective',
+        type: GraphQLInt,
+        resolve(stats) {
+          return stats.COLLECTIVE || 0;
+        },
+      },
+    };
+  },
+});
+
+const PlanType = new GraphQLObjectType({
+  name: 'PlanType',
+  description: 'The name of the current plan and its characteristics.',
+  fields: () => ({
+    // We always have to return an id for apollo's caching
+    id: {
+      type: GraphQLInt,
+      resolve(collective) {
+        return collective.id;
+      },
+    },
+    name: {
+      type: GraphQLString,
+    },
+    hostedCollectives: {
+      type: GraphQLInt,
+    },
+    hostDashboard: {
+      type: GraphQLBoolean,
+    },
+    manualPayments: {
+      type: GraphQLBoolean,
+    },
+    hostFees: {
+      type: GraphQLBoolean,
+    },
+    hostFeeSharePercent: {
+      type: GraphQLFloat,
+    },
+  }),
+});
+
+export const CollectiveStatsType = new GraphQLObjectType({
+  name: 'CollectiveStatsType',
+  description: 'Stats for the collective',
+  fields: () => {
+    return {
+      // We always have to return an id for apollo's caching
+      id: {
+        type: GraphQLInt,
+        resolve(collective) {
+          return collective.id;
+        },
+      },
+      balanceWithBlockedFunds: {
+        description: 'Amount of money in cents in the currency of the collective currently available to spend',
+        type: GraphQLFloat,
+        resolve(collective, args, req) {
+          return collective.getBalanceWithBlockedFunds({ loaders: req.loaders });
+        },
+      },
+      balance: {
+        description: 'Amount of money in cents in the currency of the collective.',
+        type: GraphQLFloat,
+        resolve(collective, args, req) {
+          return collective.getBalance({ loaders: req.loaders });
+        },
+      },
+      // Used by `fetchMembersStats` in REST service
+      backers: {
+        description: 'Breakdown of all backers of this collective',
+        type: BackersStatsType,
+        resolve(collective, args, req) {
+          return req.loaders.Collective.stats.backers.load(collective.id);
+        },
+      },
+      // Used by the Hero of the collective page
+      totalAmountSpent: {
+        description: 'Total amount spent',
+        type: GraphQLFloat,
+        resolve(collective, _, req) {
+          return collective.getTotalAmountSpent({ loaders: req.loaders, net: true });
+        },
+      },
+      yearlyBudget: {
+        type: GraphQLFloat,
+        resolve(collective, args, req) {
+          return collective.getYearlyBudget({ loaders: req.loaders });
+        },
+      },
+    };
+  },
+});
+
+export const CollectiveInterfaceType = new GraphQLInterfaceType({
+  name: 'CollectiveInterface',
+  description: 'Collective interface',
+  resolveType: collective => {
+    switch (collective.type) {
+      case CollectiveTypeEnum.COLLECTIVE:
+      case CollectiveTypeEnum.BOT:
+        return 'Collective';
+      case CollectiveTypeEnum.USER:
+        return 'User';
+      case CollectiveTypeEnum.ORGANIZATION:
+        return 'Organization';
+      case CollectiveTypeEnum.EVENT:
+        return 'Event';
+      case CollectiveTypeEnum.PROJECT:
+        return 'Project';
+      case CollectiveTypeEnum.FUND:
+        return 'Fund';
+      case CollectiveTypeEnum.VENDOR:
+        return 'Vendor';
+      default:
+        return null;
+    }
+  },
+  fields: () => {
+    return {
+      id: { type: GraphQLInt },
+      idV2: { type: GraphQLString },
+      parentCollective: { type: CollectiveInterfaceType },
+      children: { type: new GraphQLNonNull(new GraphQLList(CollectiveInterfaceType)) },
+      type: { type: GraphQLString },
+      isActive: { type: GraphQLBoolean },
+      hasHosting: { type: GraphQLBoolean },
+      name: { type: GraphQLString },
+      legalName: { type: GraphQLString },
+      company: { type: GraphQLString },
+      description: { type: GraphQLString },
+      longDescription: { type: GraphQLString },
+      expensePolicy: { type: GraphQLString },
+      tags: { type: new GraphQLList(GraphQLString) },
+      location: {
+        type: LocationType,
+        description: 'Name, address, country, lat, long of the location.',
+      },
+      createdAt: { type: DateString },
+      startsAt: { type: DateString },
+      endsAt: { type: DateString },
+      timezone: { type: GraphQLString },
+      hostFeePercent: { type: GraphQLFloat },
+      platformFeePercent: { type: GraphQLFloat },
+      currency: { type: GraphQLString },
+      image: { type: GraphQLString },
+      imageUrl: {
+        type: GraphQLString,
+        args: {
+          height: { type: GraphQLInt },
+        },
+      },
+      backgroundImage: { type: GraphQLString },
+      backgroundImageUrl: {
+        type: GraphQLString,
+        args: {
+          height: { type: GraphQLInt },
+        },
+      },
+      settings: { type: new GraphQLNonNull(GraphQLJSON) },
+      data: {
+        type: GraphQLJSON,
+        deprecationReason: '2020-10-08: This field is not provided anymore and will return an empty object',
+      },
+      privateInstructions: {
+        type: GraphQLString,
+        description: 'Private instructions related to an event',
+      },
+      slug: { type: GraphQLString },
+      path: { type: GraphQLString },
+      isHost: { type: GraphQLBoolean },
+      isTrustedHost: { type: new GraphQLNonNull(GraphQLBoolean) },
+      isFirstPartyHost: { type: new GraphQLNonNull(GraphQLBoolean) },
+      isVerified: { type: new GraphQLNonNull(GraphQLBoolean) },
+      isIncognito: { type: GraphQLBoolean },
+      isPrivate: { type: new GraphQLNonNull(GraphQLBoolean) },
+      isFrozen: { type: new GraphQLNonNull(GraphQLBoolean), description: 'Whether this account is frozen' },
+      isSuspended: { type: new GraphQLNonNull(GraphQLBoolean), description: 'Whether this account is suspended' },
+      isGuest: { type: GraphQLBoolean },
+      canApply: { type: GraphQLBoolean },
+      canContact: { type: new GraphQLNonNull(GraphQLBoolean) },
+      isArchived: { type: GraphQLBoolean },
+      isApproved: { type: GraphQLBoolean },
+      isDeletable: { type: GraphQLBoolean },
+      host: { type: CollectiveInterfaceType },
+      hostCollective: { type: CollectiveInterfaceType },
+      members: {
+        type: new GraphQLList(MemberType),
+        description:
+          'List of all collectives that are related to this collective with their membership relationship. Can filter by role (BACKER/MEMBER/ADMIN/HOST/FOLLOWER)',
+        args: {
+          limit: { type: GraphQLInt, defaultValue: 100 },
+          offset: { type: GraphQLInt, defaultValue: 0 },
+          type: {
+            type: GraphQLString,
+            description: 'Type of User: USER/ORGANIZATION',
+          },
+          TierId: { type: GraphQLInt },
+          tierSlug: { type: GraphQLString },
+          role: { type: GraphQLString },
+          roles: { type: new GraphQLList(GraphQLString) },
+        },
+      },
+      memberOf: {
+        type: new GraphQLList(MemberType),
+        description:
+          'List of all collectives that this collective is a member of with their membership relationship. Can filter by role (BACKER/MEMBER/ADMIN/HOST/FOLLOWER)',
+        args: {
+          limit: { type: GraphQLInt },
+          offset: { type: GraphQLInt },
+          type: {
+            type: GraphQLString,
+            description: 'Type of collective (COLLECTIVE, EVENT, ORGANIZATION)',
+          },
+          role: { type: GraphQLString },
+          roles: { type: new GraphQLList(GraphQLString) },
+          onlyActiveCollectives: {
+            type: GraphQLBoolean,
+            description: 'Only return memberships for active collectives (that have been approved by the host)',
+            defaultValue: false,
+          },
+          includeIncognito: {
+            type: GraphQLBoolean,
+            defaultValue: true,
+            description:
+              'Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.',
+          },
+        },
+      },
+      contributors: {
+        type: new GraphQLList(ContributorType),
+        description: 'All the persons and entities that contribute to this organization',
+        args: {
+          limit: { type: GraphQLInt, defaultValue: 1000 },
+          roles: { type: new GraphQLList(ContributorRoleEnum) },
+        },
+      },
+      notifications: {
+        type: new GraphQLList(NotificationType),
+        description: 'List of all notifications for this collective',
+        args: {
+          limit: { type: GraphQLInt },
+          offset: { type: GraphQLInt },
+          channel: { type: GraphQLString },
+          type: { type: GraphQLString },
+          active: { type: GraphQLBoolean },
+        },
+      },
+      platformContributionAvailable: {
+        type: new GraphQLNonNull(GraphQLBoolean),
+        description:
+          'Returns true if a custom contribution to Open Collective can be submitted for contributions made to this account',
+      },
+      tiers: {
+        type: new GraphQLList(TierType),
+        args: {
+          id: { type: GraphQLInt },
+          slug: { type: GraphQLString },
+          slugs: { type: new GraphQLList(GraphQLString) },
+          onlyValid: {
+            type: GraphQLBoolean,
+            defaultValue: true,
+            description:
+              'When true (default), exclude tiers with types that are no longer supported. Use false for edit pages to show all tiers.',
+          },
+        },
+      },
+      orders: {
+        type: new GraphQLList(OrderType),
+        args: {
+          status: { type: OrderStatusType },
+        },
+      },
+      stats: { type: CollectiveStatsType },
+      supportedExpenseTypes: {
+        type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GraphQLString))),
+        description: 'The list of expense types supported by this account',
+      },
+      twitterHandle: { type: GraphQLString, deprecationReason: '2023-01-16: Please use socialLinks' },
+      githubHandle: { type: GraphQLString, deprecationReason: '2022-06-03: Please use repositoryUrl' },
+      repositoryUrl: { type: GraphQLString, deprecationReason: '2023-01-16: Please use socialLinks' },
+      website: { type: GraphQLString, deprecationReason: '2023-01-16: Please use socialLinks' },
+      socialLinks: {
+        type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GraphQLSocialLink))),
+      },
+      events: {
+        type: new GraphQLList(EventCollectiveType),
+        args: {
+          limit: { type: GraphQLInt },
+          offset: { type: GraphQLInt },
+          includePastEvents: {
+            type: GraphQLBoolean,
+            defaultValue: false,
+            description: 'Include past events',
+          },
+          includeInactive: {
+            type: GraphQLBoolean,
+            defaultValue: false,
+            description: 'Include inactive events',
+          },
+        },
+      },
+      projects: {
+        type: new GraphQLList(ProjectCollectiveType),
+        args: {
+          limit: { type: GraphQLInt },
+          offset: { type: GraphQLInt },
+        },
+      },
+      paymentMethods: {
+        type: new GraphQLList(PaymentMethodType),
+        args: {
+          service: { type: GraphQLString },
+          limit: { type: GraphQLInt },
+          hasBalanceAboveZero: { type: GraphQLBoolean },
+          isConfirmed: {
+            type: GraphQLBoolean,
+            description: 'Only return confirmed payment methods',
+            defaultValue: true,
+          },
+          type: {
+            type: new GraphQLList(GraphQLString),
+            description: 'Filter on given types  (creditcard, giftcard, etc.)',
+          },
+          includeHostCollectivePaymentMethod: {
+            type: GraphQLBoolean,
+            defaultValue: false,
+            description: 'Defines if the host "collective" payment method should be returned',
+          },
+        },
+      },
+      giftCardsBatches: {
+        type: new GraphQLList(PaymentMethodBatchInfo),
+        description:
+          'List all the gift cards batches emitted by this collective. May include `null` as key for unbatched gift cards.',
+      },
+      createdGiftCards: {
+        type: PaginatedPaymentMethodsType,
+        args: {
+          limit: { type: GraphQLInt },
+          offset: { type: GraphQLInt },
+          batch: { type: GraphQLString },
+          isConfirmed: {
+            type: GraphQLBoolean,
+            description: 'Whether the gift card has been claimed or not',
+          },
+        },
+      },
+      connectedAccounts: { type: new GraphQLList(ConnectedAccountType) },
+      features: {
+        type: new GraphQLNonNull(GraphQLCollectiveFeatures),
+        description: 'Describes the features enabled and available for this collective',
+      },
+      plan: { type: PlanType },
+      contributionPolicy: { type: GraphQLString },
+      categories: {
+        type: new GraphQLNonNull(new GraphQLList(GraphQLString)),
+        description: 'Categories set by Open Collective to help moderation.',
+      },
+      policies: {
+        type: new GraphQLNonNull(GraphQLPolicies),
+        description:
+          'Policies for the account. To see non-public policies you need to be admin and have the scope: "account".',
+      },
+    };
+  },
+});
+
+const CollectiveFields = () => {
+  return {
+    id: {
+      type: GraphQLInt,
+      resolve(collective) {
+        return collective.id;
+      },
+    },
+    idV2: {
+      type: GraphQLString,
+      resolve(collective) {
+        return idEncode(collective.id, IDENTIFIER_TYPES.ACCOUNT);
+      },
+    },
+    parentCollective: {
+      type: CollectiveInterfaceType,
+      resolve(collective, args, req) {
+        return collective.getParentCollective({ loaders: req.loaders });
+      },
+    },
+    children: {
+      type: new GraphQLNonNull(new GraphQLList(CollectiveInterfaceType)),
+      resolve(collective) {
+        return collective.getChildren({
+          where: {
+            data: { isSuspended: { [Op.not]: true } },
+            type: { [Op.ne]: CollectiveTypeEnum.VENDOR },
+          },
+        });
+      },
+    },
+    type: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.type;
+      },
+    },
+    isActive: {
+      type: GraphQLBoolean,
+      resolve(collective) {
+        return collective.isActive;
+      },
+    },
+    hasHosting: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      resolve(collective) {
+        return collective.hasHosting;
+      },
+    },
+    name: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.name;
+      },
+    },
+    legalName: {
+      type: GraphQLString,
+      async resolve(collective, _, req) {
+        if (
+          !canSeeLegalName(req.remoteUser, collective) &&
+          !getContextPermission(req, PERMISSION_TYPE.SEE_ACCOUNT_PRIVATE_PROFILE_INFO, collective.id)
+        ) {
+          return null;
+        } else if (collective.isIncognito) {
+          const mainProfile = await req.loaders.Collective.mainProfileFromIncognito.load(collective.id);
+          if (mainProfile) {
+            return mainProfile.legalName || mainProfile.name;
+          }
+        } else {
+          return collective.legalName;
+        }
+      },
+    },
+    company: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.company;
+      },
+    },
+    description: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.description;
+      },
+    },
+    longDescription: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.longDescription;
+      },
+    },
+    expensePolicy: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.expensePolicy;
+      },
+    },
+    tags: {
+      type: new GraphQLList(GraphQLString),
+      resolve(collective) {
+        return collective.tags;
+      },
+    },
+    location: {
+      type: LocationType,
+      description: 'Name, address, lat, long of the location.',
+      async resolve(collective, _, req) {
+        if (collective.hasPublicLocation()) {
+          return req.loaders.Location.byCollectiveId.load(collective.id);
+        } else if (!req.remoteUser) {
+          return null;
+        } else if (req.remoteUser.isAdminOfCollective(collective)) {
+          // For incognito profiles, we retrieve the location from the main user profile
+          if (collective.isIncognito) {
+            const mainProfile = await req.loaders.Collective.mainProfileFromIncognito.load(collective.id);
+            if (mainProfile) {
+              return req.loaders.Location.byCollectiveId.load(mainProfile.id);
+            }
+          }
+
+          return req.loaders.Location.byCollectiveId.load(collective.id);
+        } else if (await req.loaders.Collective.canSeePrivateLocation.load(collective.id)) {
+          return req.loaders.Location.byCollectiveId.load(collective.id);
+        }
+      },
+    },
+    createdAt: {
+      type: DateString,
+      resolve(collective) {
+        return collective.createdAt;
+      },
+    },
+    startsAt: {
+      type: DateString,
+      resolve(collective) {
+        return collective.startsAt;
+      },
+    },
+    endsAt: {
+      type: DateString,
+      resolve(collective) {
+        return collective.endsAt;
+      },
+    },
+    timezone: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.timezone;
+      },
+    },
+    hostFeePercent: {
+      type: GraphQLFloat,
+      resolve(collective) {
+        return collective.hostFeePercent;
+      },
+    },
+    platformFeePercent: {
+      type: GraphQLFloat,
+      resolve(collective) {
+        return collective.platformFeePercent;
+      },
+    },
+    currency: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.currency;
+      },
+    },
+    image: {
+      type: GraphQLString,
+      async resolve(collective, args, req) {
+        if (collective.type === 'EVENT' && !collective.image) {
+          const parentCollective = await req.loaders.Collective.byId.load(collective.ParentCollectiveId);
+          if (parentCollective) {
+            return parentCollective.image;
+          }
+        }
+        return collective.image;
+      },
+    },
+    imageUrl: {
+      type: GraphQLString,
+      args: {
+        height: { type: GraphQLInt },
+      },
+      async resolve(collective, args, req) {
+        if (collective.type === 'EVENT' && !collective.image) {
+          const parentCollective = await req.loaders.Collective.byId.load(collective.ParentCollectiveId);
+          if (parentCollective) {
+            return parentCollective.getImageUrl(args);
+          }
+        }
+        return collective.getImageUrl(args);
+      },
+    },
+    backgroundImage: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.backgroundImage;
+      },
+    },
+    backgroundImageUrl: {
+      type: GraphQLString,
+      args: {
+        height: { type: GraphQLInt },
+      },
+      resolve(collective, args) {
+        return collective.getBackgroundImageUrl(args);
+      },
+    },
+    settings: {
+      type: new GraphQLNonNull(GraphQLJSON),
+      resolve(collective) {
+        return collective.settings;
+      },
+    },
+    data: {
+      type: GraphQLJSON,
+      deprecationReason: '2020-10-08: This field is not provided anymore and will return an empty object',
+      resolve() {
+        return {};
+      },
+    },
+    privateInstructions: {
+      type: GraphQLString,
+      description: 'Private instructions related to an event',
+      resolve(collective, _, req) {
+        if (
+          collective.type === CollectiveTypeEnum.EVENT &&
+          (req.remoteUser?.isAdminOfCollective(collective) ||
+            req.remoteUser?.hasRole(MemberRoles.PARTICIPANT, collective))
+        ) {
+          return collective.data?.privateInstructions;
+        }
+      },
+    },
+    slug: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.slug;
+      },
+    },
+    path: {
+      type: GraphQLString,
+      async resolve(collective) {
+        return await collective.getUrlPath();
+      },
+    },
+    isHost: {
+      description: 'Returns whether this collective can host other collectives (ie. has a Stripe Account connected)',
+      type: GraphQLBoolean,
+      resolve(collective) {
+        return collective.isHost();
+      },
+    },
+    isTrustedHost: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description: 'Returns whether this host is trusted or not',
+      resolve: collective => Boolean(get(collective, 'data.isTrustedHost')),
+    },
+    isFirstPartyHost: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description: 'Returns whether this host is trusted or not',
+      resolve: collective => Boolean(get(collective, 'data.isFirstPartyHost')),
+    },
+    isVerified: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description: 'Whether the account is verified',
+      resolve(collective) {
+        return get(collective, 'data.isVerified') || false;
+      },
+    },
+    isTwoFactorAuthEnabled: {
+      type: GraphQLBoolean,
+      description: 'Returns whether this user has two factor authentication enabled',
+      async resolve(collective, _, req) {
+        if (req.remoteUser?.isAdmin(collective.id) || req.remoteUser?.isRoot()) {
+          if (collective.type === CollectiveTypeEnum.USER) {
+            const user = await models.User.findOne({
+              where: { CollectiveId: collective.id },
+            });
+            return await user.hasTwoFactorAuthentication();
+          }
+          return false;
+        } else {
+          return null;
+        }
+      },
+    },
+    canApply: {
+      description: 'Returns whether this host accepts applications for new collectives',
+      type: GraphQLBoolean,
+      resolve(collective) {
+        return collective.canApply();
+      },
+    },
+    canContact: {
+      description: 'Returns whether this collectives can be contacted',
+      type: new GraphQLNonNull(GraphQLBoolean),
+      async resolve(collective, _, req) {
+        return hasFeature(collective, FEATURE.CONTACT_FORM, { loaders: req.loaders });
+      },
+    },
+    isIncognito: {
+      description: 'Returns whether this collective is incognito',
+      type: GraphQLBoolean,
+      resolve(collective) {
+        return collective.isIncognito;
+      },
+    },
+    isPrivate: {
+      description: 'Returns whether this collective is private',
+      type: new GraphQLNonNull(GraphQLBoolean),
+    },
+    isGuest: {
+      description: 'Returns whether this collective is a guest profile',
+      type: GraphQLBoolean,
+      resolve(collective) {
+        return Boolean(collective.data?.isGuest);
+      },
+    },
+    isFrozen: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description: 'Whether this account is frozen',
+      resolve(collective) {
+        return get(collective, `data.features.${FEATURE.ALL}`) === false;
+      },
+    },
+    isSuspended: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description: 'Whether this account is suspended',
+      resolve(collective) {
+        return get(collective, `data.isSuspended`) === true;
+      },
+    },
+    isArchived: {
+      description: 'Returns whether this collective is archived',
+      type: GraphQLBoolean,
+      resolve(collective) {
+        return Boolean(collective.deactivatedAt && !collective.isActive);
+      },
+    },
+    isApproved: {
+      description: 'Returns whether this collective is approved',
+      type: GraphQLBoolean,
+      async resolve(collective, _, req) {
+        if (!collective.HostCollectiveId) {
+          return false;
+        } else if (collective.type === CollectiveTypeEnum.EVENT) {
+          const ParentCollectiveId = collective.ParentCollectiveId;
+          const parentCollective = ParentCollectiveId && (await req.loaders.Collective.byId.load(ParentCollectiveId));
+          // In the future, we should make it possible to directly read the approvedAt of the event
+          return parentCollective && (parentCollective.hasMoneyManagement || parentCollective.isApproved());
+        } else {
+          return collective.isApproved();
+        }
+      },
+    },
+    isDeletable: {
+      description: 'Returns whether this collective is deletable',
+      type: GraphQLBoolean,
+      resolve(collective) {
+        return isCollectiveDeletable(collective);
+      },
+    },
+    host: {
+      description: 'Get the host collective that is receiving the money on behalf of this collective',
+      type: CollectiveInterfaceType,
+      resolve: hostResolver,
+    },
+    hostCollective: {
+      description: 'A host might have a collective attached to it',
+      type: CollectiveInterfaceType,
+      resolve(collective, args, req) {
+        if (has(collective.settings, 'hostCollective.id')) {
+          return req.loaders.Collective.byId.load(get(collective.settings, 'hostCollective.id'));
+        }
+        if (collective.id === collective.HostCollectiveId) {
+          return collective;
+        }
+        return null;
+      },
+    },
+    members: {
+      description: 'Get all the members of this collective (admins, members, backers, followers)',
+      type: new GraphQLList(MemberType),
+      args: {
+        limit: { type: GraphQLInt, defaultValue: 100 },
+        offset: { type: GraphQLInt, defaultValue: 0 },
+        type: { type: GraphQLString },
+        role: { type: GraphQLString },
+        TierId: { type: GraphQLInt },
+        tierSlug: { type: GraphQLString },
+        roles: { type: new GraphQLList(GraphQLString) },
+      },
+      resolve(collective, args, req) {
+        if (collective.isIncognito && !req.remoteUser?.isAdmin(collective.id)) {
+          return [];
+        }
+
+        // Check Pagination arguments
+        if (isNil(args.limit) || args.limit < 0) {
+          args.limit = 100;
+        }
+        if (isNil(args.offset) || args.offset < 0) {
+          args.offset = 0;
+        }
+        if (args.limit > 1000 && !req.remoteUser?.isRoot()) {
+          logger.warn('GraphQL v1: members limit over 1,000, using 1,000 as maximum limit');
+          args.limit = 1000;
+          // throw new Error('Cannot fetch more than 1,000 members at the same time, please adjust the limit');
+        }
+
+        const query = {
+          limit: args.limit,
+          offset: args.offset,
+          order: [['id', 'ASC']],
+        };
+
+        query.where = { CollectiveId: collective.id };
+        if (args.TierId) {
+          query.where.TierId = args.TierId;
+        }
+        const roles = args.roles || (args.role && [args.role]);
+
+        if (roles && roles.length > 0) {
+          query.where.role = { [Op.in]: roles };
+        }
+
+        let conditionOnMemberCollective;
+        if (args.type) {
+          const types = args.type.split(',');
+          conditionOnMemberCollective = { type: { [Op.in]: types } };
+        }
+
+        query.include = [
+          {
+            model: models.Collective,
+            as: 'memberCollective',
+            required: true,
+            where: conditionOnMemberCollective,
+          },
+        ];
+
+        if (args.tierSlug) {
+          query.include.push({
+            model: models.Tier,
+            where: { slug: args.tierSlug },
+          });
+        }
+
+        return models.Member.findAll(query);
+      },
+    },
+    memberOf: {
+      description: 'Get all the collective this collective is a member of (as a member, backer, follower, etc.)',
+      type: new GraphQLList(MemberType),
+      args: {
+        limit: { type: GraphQLInt },
+        offset: { type: GraphQLInt },
+        type: {
+          type: GraphQLString,
+          description: 'Type of collective (COLLECTIVE, EVENT, ORGANIZATION)',
+        },
+        role: { type: GraphQLString },
+        roles: { type: new GraphQLList(GraphQLString) },
+        onlyActiveCollectives: {
+          type: GraphQLBoolean,
+          description: 'Only return memberships for active collectives (that have been approved by the host)',
+          defaultValue: false,
+        },
+        includeIncognito: {
+          type: GraphQLBoolean,
+          defaultValue: true,
+          description:
+            'Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.',
+        },
+      },
+      async resolve(collective, args, req) {
+        const where = { MemberCollectiveId: collective.id };
+        const roles = args.roles || (args.role && [args.role]);
+        if (roles && roles.length > 0) {
+          where.role = { [Op.in]: roles };
+        }
+        const collectiveConditions = { isPrivate: false };
+        if (args.type) {
+          collectiveConditions.type = args.type;
+        }
+        if (args.onlyActiveCollectives) {
+          collectiveConditions.isActive = true;
+        }
+        if (!args.includeIncognito || !(req.remoteUser?.isAdmin(collective.id) || req.remoteUser?.isRoot())) {
+          collectiveConditions.isIncognito = false; // only admins can see incognito profiles
+        }
+
+        // Handle private accounts
+        if (req.remoteUser) {
+          if (req.remoteUser.isRoot()) {
+            // Allow all private accounts to be seen by root admins
+            delete collectiveConditions.isPrivate;
+          } else {
+            const directAccess = req.remoteUser.getCollectiveIdsForRoles(MemberRolesForPrivateAccounts);
+            if (directAccess.size) {
+              const idsList = Array.from(directAccess);
+              delete collectiveConditions.isPrivate;
+              collectiveConditions[Op.or] = [
+                { isPrivate: false },
+                { id: idsList }, // User is an admin of accountant of the collective
+                { ParentCollectiveId: idsList }, // User is an admin of accountant of the collective's parent collective (for events/projects)
+                { HostCollectiveId: idsList, approvedAt: { [Op.ne]: null } }, // User is an admin of accountant of the collective's fiscal host
+              ];
+            }
+          }
+        }
+
+        return models.Member.findAll({
+          where,
+          limit: args.limit,
+          offset: args.offset,
+          include: [
+            {
+              model: models.Collective,
+              as: 'collective',
+              where: collectiveConditions,
+              required: true,
+            },
+          ],
+        });
+      },
+    },
+    contributors: {
+      type: new GraphQLList(ContributorType),
+      description: 'All the persons and entities that contribute to this organization',
+      args: {
+        limit: { type: GraphQLInt, defaultValue: 1000 },
+        roles: { type: new GraphQLList(ContributorRoleEnum) },
+      },
+      async resolve(collective, args, req) {
+        if (collective.isIncognito || collective.type === 'USER') {
+          return [];
+        }
+
+        const contributors = await req.loaders.Contributors.forCollectiveId.load(collective.id);
+        return filterContributors(req, contributors.all, args);
+      },
+    },
+    notifications: {
+      type: new GraphQLList(NotificationType),
+      args: {
+        limit: { type: GraphQLInt },
+        offset: { type: GraphQLInt },
+        channel: { type: GraphQLString },
+        type: { type: GraphQLString },
+        active: { type: GraphQLBoolean },
+      },
+      resolve(collective, args, req) {
+        // There's no reason for other people than admins to know about this.
+        // Also the webhooks URL are supposed to be private (can contain tokens).
+        if (!req.remoteUser || !req.remoteUser.isAdminOfCollective(collective)) {
+          return [];
+        }
+
+        const where = { CollectiveId: collective.id };
+
+        if (args.channel) {
+          where.channel = args.channel;
+        }
+        if (args.type) {
+          where.type = args.type;
+        }
+        if (args.active) {
+          where.active = args.active;
+        }
+
+        return models.Notification.findAll({
+          where: where,
+          limit: args.limit,
+          offset: args.offset,
+          order: [['createdAt', 'ASC']],
+        });
+      },
+    },
+    platformContributionAvailable: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description:
+        'Returns true if a custom contribution to Open Collective can be submitted for contributions made to this account',
+      async resolve(account, _, req) {
+        return account.hasPlatformTips({ loaders: req.loaders });
+      },
+    },
+    tiers: {
+      type: new GraphQLList(TierType),
+      deprecationReason: '2025-12-05: Will be deleted soon. Use GraphQL v2',
+      args: {
+        id: { type: GraphQLInt },
+        slug: { type: GraphQLString },
+        slugs: { type: new GraphQLList(GraphQLString) },
+        onlyValid: {
+          type: GraphQLBoolean,
+          defaultValue: true,
+          description:
+            'When true (default), exclude tiers with types that are no longer supported. Use false for edit pages to show all tiers.',
+        },
+      },
+      async resolve(collective, args, req) {
+        const where = {};
+
+        if (args.id) {
+          where.id = args.id;
+        } else if (args.slug) {
+          where.slug = args.slug;
+        } else if (args.slugs && args.slugs.length > 0) {
+          where.slug = { [Op.in]: args.slugs };
+        }
+
+        // Filter out forbidden tier types
+        if (args.onlyValid !== false) {
+          const host = await req.loaders.Collective.host.load(collective);
+          const allowedTierTypes = Tier.getAllowedTierTypes(collective, host);
+          if (allowedTierTypes.length !== AllTierTypes.length) {
+            where.type = allowedTierTypes;
+          }
+        }
+
+        return collective.getTiers({
+          where,
+          order: [['amount', 'ASC']],
+        });
+      },
+    },
+    orders: {
+      type: new GraphQLList(OrderType),
+      args: {
+        status: { type: OrderStatusType },
+      },
+      resolve(collective, args = {}) {
+        const where = {};
+
+        if (args.status) {
+          where.status = args.status;
+        } else {
+          where.processedAt = { [Op.ne]: null };
+        }
+
+        return collective.getIncomingOrders({
+          where,
+          // We never return private accounts related stuff on GraphQL V1
+          include: [
+            { association: 'fromCollective', where: { isPrivate: false }, required: true, attributes: [] },
+            { association: 'collective', where: { isPrivate: false }, required: true, attributes: [] },
+          ],
+          order: [
+            ['createdAt', 'DESC'],
+            ['id', 'DESC'],
+          ],
+        });
+      },
+    },
+    supportedExpenseTypes: {
+      type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GraphQLString))),
+      description: 'The list of expense types supported by this account',
+      async resolve(collective, _, req) {
+        const host = collective.hasMoneyManagement
+          ? collective
+          : collective.HostCollectiveId && (await req.loaders.Collective.byId.load(collective.HostCollectiveId));
+        const parent =
+          collective.ParentCollectiveId && (await req.loaders.Collective.byId.load(collective.ParentCollectiveId));
+
+        // Aggregate all configs, using the order of priority collective > parent > host
+        const getExpenseTypes = account => omitBy(account?.settings?.expenseTypes, isNull);
+        const defaultExpenseTypes = { GRANT: false, INVOICE: true, RECEIPT: true };
+        const aggregatedConfig = merge(defaultExpenseTypes, ...[host, parent, collective].map(getExpenseTypes));
+        const supportedFromConfig = Object.keys(aggregatedConfig).filter(key => aggregatedConfig[key]); // Return only the truthy ones
+        if (supportedFromConfig.includes('GRANT')) {
+          const hasGrantsFeature = await hasFeature(host, FEATURE.FUNDS_GRANTS_MANAGEMENT, {
+            loaders: req.loaders,
+          });
+          if (!hasGrantsFeature) {
+            return supportedFromConfig.filter(type => type !== 'GRANT');
+          }
+        }
+
+        return supportedFromConfig;
+      },
+    },
+    twitterHandle: {
+      type: GraphQLString,
+      deprecationReason: '2023-01-16: Please use socialLinks',
+      resolve(collective) {
+        return collective.twitterHandle;
+      },
+    },
+    githubHandle: {
+      type: GraphQLString,
+      deprecationReason: '2022-06-03: Please use repositoryUrl',
+    },
+    repositoryUrl: {
+      type: GraphQLString,
+      description: 'The URL of the repository',
+      deprecationReason: '2023-01-16: Please use socialLinks',
+    },
+    website: {
+      type: GraphQLString,
+      deprecationReason: '2023-01-16: Please use socialLinks',
+      resolve(collective) {
+        return collective.website;
+      },
+    },
+    socialLinks: {
+      type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GraphQLSocialLink))),
+      async resolve(collective, _, req) {
+        return req.loaders.SocialLink.byCollectiveId.load(collective.id);
+      },
+    },
+    events: {
+      type: new GraphQLList(EventCollectiveType),
+      args: {
+        limit: { type: GraphQLInt },
+        offset: { type: GraphQLInt },
+        includePastEvents: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Include past events',
+        },
+        includeInactive: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Include inactive events',
+        },
+      },
+      resolve(collective, args) {
+        const query = { where: { isPrivate: false, data: { isSuspended: { [Op.not]: true } } } };
+
+        if (args.limit) {
+          query.limit = args.limit;
+        }
+        if (args.offset) {
+          query.offset = args.offset;
+        }
+        if (!args.includeInactive) {
+          query.where.isActive = true;
+        }
+        if (!args.includePastEvents) {
+          // Use midnight so we only mark events as passed the day after
+          const today = new Date().setHours(0, 0, 0, 0);
+          query.where = {
+            [Op.and]: [
+              // Include all previous conditions
+              query.where,
+              // An event is not passed if end date is in the future OR if end date
+              // is not set but start date is in the past OR if there's no start date
+              // nor end date
+              {
+                [Op.or]: [
+                  { startsAt: null, endsAt: null },
+                  { endsAt: { [Op.gte]: Date.now() } },
+                  { endsAt: null, startsAt: { [Op.gte]: today } },
+                ],
+              },
+            ],
+          };
+        }
+
+        return collective.getEvents(query);
+      },
+    },
+    projects: {
+      type: new GraphQLList(ProjectCollectiveType),
+      args: {
+        limit: { type: GraphQLInt },
+        offset: { type: GraphQLInt },
+      },
+      resolve(collective, args) {
+        return collective.getProjects({
+          ...args,
+          where: { isPrivate: false, data: { isSuspended: { [Op.not]: true } } },
+        });
+      },
+    },
+    paymentMethods: {
+      type: new GraphQLList(PaymentMethodType),
+      args: {
+        service: { type: GraphQLString },
+        limit: { type: GraphQLInt },
+        hasBalanceAboveZero: { type: GraphQLBoolean },
+        isConfirmed: { type: GraphQLBoolean, defaultValue: true },
+        type: { type: new GraphQLList(GraphQLString) },
+        includeHostCollectivePaymentMethod: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Defines if the host "collective" payment method should be returned',
+        },
+      },
+      async resolve(collective, args, req) {
+        if (!req.remoteUser || !req.remoteUser.isAdminOfCollective(collective)) {
+          return [];
+        }
+        let paymentMethods = await req.loaders.PaymentMethod.findByCollectiveId.load(collective.id);
+        // Filter Payment Methods used by Hosts for "Add Funds"
+        if (
+          !args.includeHostCollectivePaymentMethod &&
+          (collective.type === 'ORGANIZATION' || collective.type === 'USER')
+        ) {
+          paymentMethods = paymentMethods.filter(pm => !(pm.service === 'opencollective' && pm.type === 'host'));
+        }
+        // Filter only "saved" stripe Payment Methods
+        // In the future we should only return the "saved" whatever the service
+        paymentMethods = paymentMethods.filter(pm => pm.service !== 'stripe' || pm.saved);
+
+        paymentMethods = paymentMethods.filter(pm => !(pm.data && pm.data.hidden));
+
+        if (args.service) {
+          paymentMethods = paymentMethods.filter(pm => pm.service === args.service.toLowerCase());
+        }
+        if (args.type) {
+          paymentMethods = paymentMethods.filter(pm => args.type.map(t => t.toLowerCase()).includes(pm.type));
+        }
+        if (args.isConfirmed !== undefined) {
+          paymentMethods = paymentMethods.filter(pm => pm.isConfirmed() === args.isConfirmed);
+        }
+        if (args.hasBalanceAboveZero) {
+          const filteredArray = [];
+          for (const paymentMethod of paymentMethods) {
+            const balance = await paymentMethod.getBalanceForUser(req.remoteUser);
+            if (balance.amount > 0) {
+              filteredArray.push(paymentMethod);
+            }
+            if (args.limit && filteredArray.length >= args.limit) {
+              break;
+            }
+          }
+          paymentMethods = filteredArray;
+        }
+        if (args.limit) {
+          paymentMethods = paymentMethods.slice(0, args.limit);
+        }
+
+        const now = new Date();
+        return paymentMethods.filter(pm => !pm.expiryDate || pm.expiryDate > now);
+      },
+    },
+    giftCardsBatches: {
+      type: new GraphQLList(PaymentMethodBatchInfo),
+      description:
+        'List all the gift cards batches emitted by this collective. May include `null` for unbatched gift cards.',
+      resolve: async (collective, _args, req) => {
+        // Must be admin of the collective
+        if (!req.remoteUser || !req.remoteUser.isAdminOfCollective(collective)) {
+          return [];
+        }
+
+        return queries.getGiftCardBatchesForCollective(collective.id);
+      },
+    },
+    createdGiftCards: {
+      type: PaginatedPaymentMethodsType,
+      description: 'Get the gift cards created by this collective. RemoteUser must be a collective admin.',
+      args: {
+        limit: { type: GraphQLInt },
+        offset: { type: GraphQLInt },
+        batch: { type: GraphQLString },
+        isConfirmed: {
+          type: GraphQLBoolean,
+          description: 'Whether the gift card has been claimed or not',
+        },
+      },
+      resolve: async (collective, args, req) => {
+        // Must be admin of the collective
+        if (!req.remoteUser || !req.remoteUser.isAdminOfCollective(collective)) {
+          return [];
+        }
+
+        const offset = args.offset || 0;
+        const limit = args.limit || 15;
+        const query = {
+          where: { type: PAYMENT_METHOD_TYPE.GIFTCARD, service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE },
+          limit: args.limit,
+          offset: args.offset,
+          order: [
+            ['createdAt', 'DESC'],
+            ['id', 'DESC'],
+          ],
+          include: [
+            {
+              model: models.PaymentMethod,
+              as: 'sourcePaymentMethod',
+              where: { CollectiveId: collective.id },
+              required: true,
+              attributes: [],
+            },
+          ],
+        };
+
+        if (args.isConfirmed !== undefined) {
+          query.where.confirmedAt = { [args.isConfirmed ? Op.ne : Op.eq]: null };
+        }
+
+        if (args.batch !== undefined) {
+          query.where.batch = args.batch;
+        }
+
+        const result = await models.PaymentMethod.findAndCountAll(query);
+
+        return {
+          paymentMethods: result.rows,
+          total: result.count,
+          limit,
+          offset,
+        };
+      },
+    },
+    connectedAccounts: {
+      type: new GraphQLList(ConnectedAccountType),
+      async resolve(collective, args, req) {
+        const connectedAccounts = await req.loaders.Collective.connectedAccounts.load(collective.id);
+        return connectedAccounts;
+      },
+    },
+    features: {
+      type: new GraphQLNonNull(GraphQLCollectiveFeatures),
+      description: 'Describes the features enabled and available for this collective',
+      resolve: collective => collective,
+    },
+    plan: {
+      type: PlanType,
+      deprecationReason: '2026-04-02: Replaced by new pricing',
+      resolve(collective) {
+        return collective.getLegacyPlan();
+      },
+    },
+    stats: {
+      type: CollectiveStatsType,
+      deprecationReason: '2025-07-10: Please use GraphQL V2',
+      resolve(collective) {
+        return collective;
+      },
+    },
+    contributionPolicy: {
+      type: GraphQLString,
+      resolve(collective) {
+        return collective.contributionPolicy;
+      },
+    },
+    categories: {
+      type: new GraphQLNonNull(new GraphQLList(GraphQLString)),
+      resolve(collective) {
+        return get(collective.data, 'categories', []);
+      },
+    },
+    policies: {
+      type: new GraphQLNonNull(GraphQLPolicies),
+      resolve(account) {
+        return account;
+      },
+    },
+  };
+};
+
+export const CollectiveType = new GraphQLObjectType({
+  name: 'Collective',
+  description: 'This represents a Collective',
+  interfaces: [CollectiveInterfaceType],
+  fields: CollectiveFields,
+});
+
+export const UserCollectiveType = new GraphQLObjectType({
+  name: 'User',
+  description: 'This represents a User Collective',
+  interfaces: [CollectiveInterfaceType],
+  fields: () => {
+    return {
+      ...CollectiveFields(),
+      email: {
+        type: GraphQLString,
+        async resolve(userCollective, args, req) {
+          if (!req.remoteUser || userCollective.isIncognito) {
+            return null;
+          } else {
+            if (await req.loaders.Collective.canSeePrivateProfileInfo.load(userCollective.id)) {
+              const user = await req.loaders.User.byCollectiveId.load(userCollective.id);
+              return user?.email;
+            }
+          }
+        },
+      },
+      newsletterOptIn: {
+        type: GraphQLBoolean,
+        async resolve(userCollective, args, req) {
+          if (!req.remoteUser || userCollective.isIncognito) {
+            return null;
+          } else {
+            if (await req.loaders.Collective.canSeePrivateProfileInfo.load(userCollective.id)) {
+              const user = await req.loaders.User.byCollectiveId.load(userCollective.id);
+              return user?.newsletterOptIn;
+            }
+          }
+        },
+      },
+    };
+  },
+});
+
+export const OrganizationCollectiveType = new GraphQLObjectType({
+  name: 'Organization',
+  description: 'This represents a Organization Collective',
+  interfaces: [CollectiveInterfaceType],
+  fields: CollectiveFields,
+});
+
+export const EventCollectiveType = new GraphQLObjectType({
+  name: 'Event',
+  description: 'This represents an Event',
+  interfaces: [CollectiveInterfaceType],
+  fields: CollectiveFields,
+});
+
+export const ProjectCollectiveType = new GraphQLObjectType({
+  name: 'Project',
+  description: 'This represents a Project',
+  interfaces: [CollectiveInterfaceType],
+  fields: CollectiveFields,
+});
+
+export const FundCollectiveType = new GraphQLObjectType({
+  name: 'Fund',
+  description: 'This represents a Fund',
+  interfaces: [CollectiveInterfaceType],
+  fields: CollectiveFields,
+});
+
+export const VendorCollectiveType = new GraphQLObjectType({
+  name: 'Vendor',
+  description: 'This represents a Vendor',
+  interfaces: [CollectiveInterfaceType],
+  fields: () => ({
+    ...CollectiveFields(),
+    hasPayoutMethod: {
+      type: GraphQLBoolean,
+      description: 'Returns whether this account has any payout methods saved',
+      async resolve(collective, _, req) {
+        const payoutMethods = await req.loaders.PayoutMethod.byCollectiveId.load(collective.id);
+        return payoutMethods.length > 0;
+      },
+    },
+    visibleToAccounts: {
+      type: new GraphQLList(CollectiveInterfaceType),
+      description:
+        'The accounts where this vendor is visible, if empty or null applies to all collectives under the vendor host',
+      async resolve(vendor, _, req) {
+        const canBeUsedWithAccountIds = vendor.data?.canBeUsedWithAccountIds || [];
+
+        if (canBeUsedWithAccountIds.length === 0) {
+          return [];
+        }
+
+        return req.loaders.Collective.byId.loadMany(canBeUsedWithAccountIds);
+      },
+    },
+  }),
+});
+
+export const CollectiveSearchResultsType = new GraphQLObjectType({
+  name: 'CollectiveSearchResults',
+  description: 'The results from searching for collectives with pagination info',
+  fields: () => ({
+    id: {
+      type: GraphQLString,
+      description: 'A unique identifier for this search (for caching)',
+    },
+    collectives: {
+      type: new GraphQLList(CollectiveInterfaceType),
+    },
+    limit: {
+      type: GraphQLInt,
+    },
+    offset: {
+      type: GraphQLInt,
+    },
+    total: {
+      type: GraphQLInt,
+    },
+  }),
+});

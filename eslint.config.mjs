@@ -1,0 +1,303 @@
+import graphqlPlugin from '@graphql-eslint/eslint-plugin'; // eslint-disable-line import/no-unresolved
+import openCollectiveConfig from 'eslint-config-opencollective/eslint-node.config.cjs';
+import globals from 'globals';
+
+import graphqlMutationScopeCheck from './eslint-rules/graphql-mutation-scope-check.js';
+import noMathRoundAmountNames from './eslint-rules/no-math-round-amount-names.js';
+import requirePrivateAccountCheck from './eslint-rules/require-private-account-check.js';
+import sequelizeModelRequirePublicIdPrefix from './eslint-rules/sequelize-model-public-id-prefix.js';
+import sequelizeModelRequireTableName from './eslint-rules/sequelize-model-table-name.js';
+
+export default [
+  ...openCollectiveConfig,
+  // Global ignores
+  {
+    ignores: [
+      '**/node_modules/',
+      '**/seeders/',
+      'migrations/archives',
+      '**/dist/',
+      '**/coverage/',
+      '**/.nyc_output',
+      '**/.vscode',
+      '**/.history',
+      'config/collective-spam-bayes.json',
+    ],
+  },
+  {
+    files: ['**/*.{js,ts}'],
+
+    processor: graphqlPlugin.processor,
+
+    plugins: {
+      'opencollective-currency': {
+        rules: {
+          'no-math-round-amount-names': noMathRoundAmountNames,
+        },
+      },
+    },
+
+    settings: {
+      'import/resolver': {
+        // You will also need to install and configure the TypeScript resolver
+        // See also https://github.com/import-js/eslint-import-resolver-typescript#configuration
+        typescript: true,
+        node: true,
+      },
+    },
+
+    languageOptions: {
+      globals: {
+        ...globals.mocha,
+      },
+    },
+
+    rules: {
+      'preserve-caught-error': 'off',
+      'opencollective-currency/no-math-round-amount-names': 'warn',
+      'no-console': 'error',
+      'import/no-commonjs': 'error',
+      'import/no-named-as-default-member': 'off',
+      'n/no-process-exit': 'off', // Applied only for CRON
+      'node/shebang': 'off',
+      'no-useless-escape': 'off',
+      'prefer-rest-params': 'off',
+      'require-atomic-updates': 'off',
+      camelcase: 'error',
+      'n/no-unsupported-features/node-builtins': 'off',
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "ObjectExpression > Property[key.name='logging'][value.value=true]",
+          message: 'Using `logging: true` in Sequelize queries is forbidden.',
+        },
+      ],
+    },
+  },
+  // Disable some rules for migrations
+  {
+    files: ['migrations/**/*.{js,ts}'],
+    rules: {
+      'import/no-commonjs': 'off',
+      'no-console': 'warn',
+    },
+  },
+  // Disable some JS rules that are enforced in TS
+  {
+    files: ['**/*.js'],
+    rules: {
+      'no-unused-vars': 'error',
+    },
+  },
+  // New TS rules
+  {
+    files: ['**/*.ts'],
+    plugins: {
+      'custom-errors': {
+        rules: {
+          'no-unthrown-errors': {
+            create(context) {
+              return {
+                NewExpression(node) {
+                  if (
+                    node.callee.name &&
+                    /^(Forbidden|ValidationFailed|NotFound|BadRequest|Unauthorized|SpamDetected|ServerError|Timeout|ConflictError|TooManyRequests|NotImplemented|CustomError|RateLimitExceeded|InvalidToken|FeatureNotSupportedForCollective|FeatureNotAllowedForUser|PlanLimit|TransferwiseError|ContentNotReady|UnexpectedError)$/.test(
+                      node.callee.name,
+                    )
+                  ) {
+                    const parent = node.parent;
+
+                    // Allow if it's inside a ThrowStatement
+                    if (parent.type === 'ThrowStatement') {
+                      return;
+                    }
+
+                    // Allow if it's the second argument of an assert() call
+                    if (
+                      parent.type === 'CallExpression' &&
+                      parent.callee.name === 'assert' &&
+                      parent.arguments.length >= 2 &&
+                      parent.arguments[1] === node
+                    ) {
+                      return;
+                    }
+
+                    // Allow if used in next(...)
+                    if (
+                      parent.type === 'CallExpression' &&
+                      parent.callee.name === 'next' &&
+                      parent.arguments.length >= 1 &&
+                      parent.arguments[0] === node
+                    ) {
+                      return;
+                    }
+
+                    context.report({
+                      node,
+                      message: `Error '${node.callee.name}' is created but not thrown. Add 'throw' before this statement.`,
+                    });
+                  }
+                },
+              };
+            },
+          },
+        },
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/no-unused-vars': 'error',
+      'custom-errors/no-unthrown-errors': 'error',
+    },
+  },
+  // Sequelize models: require public static readonly tableName = '...' as const
+  {
+    files: ['server/models/**/*.ts'],
+    plugins: {
+      'sequelize-model': {
+        rules: {
+          'require-table-name': sequelizeModelRequireTableName,
+          'require-public-id-prefix': sequelizeModelRequirePublicIdPrefix,
+        },
+      },
+    },
+    rules: {
+      'sequelize-model/require-table-name': 'error',
+      'sequelize-model/require-public-id-prefix': 'error',
+    },
+  },
+  // Tests
+  {
+    files: ['test/**/*'],
+    languageOptions: {
+      globals: {
+        ...globals.mocha,
+      },
+    },
+    rules: {
+      'n/no-unpublished-import': 'off',
+      'n/no-missing-import': 'off', // We should configure it, but it's not working for now
+      '@typescript-eslint/no-unused-expressions': 'off', // Doesn't play well with chai
+      // eslint-plugin-mocha no-exclusive-tests misses describe/it imported from 'mocha' (BDD
+      // interface only tracks globals). Use no-restricted-syntax so both styles are covered.
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "ObjectExpression > Property[key.name='logging'][value.value=true]",
+          message: 'Using `logging: true` in Sequelize queries is forbidden.',
+        },
+        {
+          selector:
+            "CallExpression[callee.type='MemberExpression'][callee.property.name='only'][callee.object.type='Identifier'][callee.object.name=/^(describe|it|context|specify|suite|test)$/]",
+          message:
+            'Do not commit focused tests (describe.only, it.only, etc.). Remove .only before committing.',
+        },
+      ],
+      'no-console': 'off',
+      'opencollective-currency/no-math-round-amount-names': 'off',
+    },
+  },
+  // Mocks
+  {
+    files: ['test/mocks/**/*', 'test/nocks/**/*'],
+    rules: {
+      camelcase: 'off',
+    },
+  },
+  // CRON jobs
+  {
+    files: ['cron/**/*'],
+    rules: {
+      'n/no-process-exit': 'off',
+      'no-console': 'warn',
+    },
+  },
+  {
+    files: ['**/*.graphql'],
+
+    languageOptions: {
+      parser: graphqlPlugin.parser,
+    },
+    plugins: {
+      '@graphql-eslint': graphqlPlugin,
+    },
+
+    settings: {
+      'import/ignore': ['.d.ts$'],
+    },
+
+    rules: {
+      '@graphql-eslint/no-deprecated': 'warn',
+      '@graphql-eslint/fields-on-correct-type': 'error',
+      '@graphql-eslint/no-duplicate-fields': 'error',
+      '@graphql-eslint/naming-convention': [
+        'error',
+        {
+          VariableDefinition: 'camelCase',
+
+          OperationDefinition: {
+            style: 'PascalCase',
+            forbiddenPrefixes: ['get', 'fetch'],
+            forbiddenSuffixes: ['Query', 'Mutation', 'Fragment'],
+          },
+        },
+      ],
+    },
+  },
+  // Scripts
+  {
+    files: ['scripts/**/*.+(js|ts)'],
+    rules: {
+      'no-console': 'warn',
+    },
+  },
+  // Enforce private-account visibility checks in top-level GraphQL query resolvers
+  {
+    files: ['server/graphql/v2/query/**/*.+(js|ts)', 'server/graphql/v1/queries.js'],
+    plugins: {
+      'private-accounts': {
+        rules: {
+          'require-account-visibility-check': requirePrivateAccountCheck,
+        },
+      },
+    },
+    rules: {
+      'private-accounts/require-account-visibility-check': 'error',
+    },
+  },
+  {
+    files: ['server/graphql/v2/**/*.+(js|ts)'],
+
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/v1/types'],
+              message: 'GraphQL V1 types should not be used with V2.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  // GraphQL mutation scope-check enforcement
+  {
+    files: [
+      'server/graphql/v2/mutation/**/*.+(js|ts)',
+      'server/graphql/v1/mutations.js',
+      'server/graphql/v1/mutations/**/*.+(js|ts)',
+    ],
+    plugins: {
+      'graphql-mutations': {
+        rules: {
+          'require-scope-check': graphqlMutationScopeCheck,
+        },
+      },
+    },
+    rules: {
+      'graphql-mutations/require-scope-check': 'error',
+    },
+  },
+];

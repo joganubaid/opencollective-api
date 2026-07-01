@@ -1,0 +1,186 @@
+import { GraphQLInt, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLDateTime, GraphQLJSONObject } from 'graphql-scalars';
+
+import ExpenseStatus from '../../../constants/expense-status';
+import { VirtualCardLimitIntervals } from '../../../constants/virtual-cards';
+import { EntityShortIdPrefix, isEntityMigratedToPublicId } from '../../../lib/permalink/entity-map';
+import { getSpendingLimitIntervalDates } from '../../../lib/stripe';
+import models, { Op, VirtualCard } from '../../../models';
+import { checkScope } from '../../common/scope-check';
+import { GraphQLCurrency } from '../enum';
+import { GraphQLVirtualCardLimitInterval } from '../enum/VirtualCardLimitInterval';
+import { GraphQLVirtualCardStatusEnum } from '../enum/VirtualCardStatus';
+import { GraphQLAccount } from '../interface/Account';
+
+import { GraphQLHost } from './Host';
+import { GraphQLIndividual } from './Individual';
+import { GraphQLVirtualCardRequest } from './VirtualCardRequest';
+
+const canSeeVirtualCardPrivateInfo = async (req: Express.Request, virtualCard: VirtualCard): Promise<boolean> => {
+  if (!virtualCard || !req.remoteUser || !checkScope(req, 'virtualCards')) {
+    return false;
+  } else if (req.remoteUser.isAdmin(virtualCard.HostCollectiveId)) {
+    return true;
+  } else {
+    const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+    return req.remoteUser.isAdminOfCollectiveOrHost(collective);
+  }
+};
+
+export const GraphQLVirtualCard = new GraphQLObjectType({
+  name: 'VirtualCard',
+  description: 'A Virtual Card used to pay expenses',
+  fields: () => ({
+    id: {
+      type: GraphQLString,
+      resolve: virtualCard => {
+        if (isEntityMigratedToPublicId(EntityShortIdPrefix.VirtualCard, virtualCard.createdAt)) {
+          return virtualCard.publicId;
+        } else {
+          return virtualCard.id;
+        }
+      },
+    },
+    publicId: {
+      type: new GraphQLNonNull(GraphQLString),
+      description: `The resource public id (ie: ${EntityShortIdPrefix.VirtualCard}_xxxxxxxx)`,
+    },
+    account: {
+      type: GraphQLAccount,
+      resolve(virtualCard, _, req) {
+        if (virtualCard.CollectiveId) {
+          return req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        }
+      },
+    },
+    host: {
+      type: GraphQLHost,
+      resolve(virtualCard, _, req) {
+        if (virtualCard.HostCollectiveId) {
+          return req.loaders.Collective.byId.load(virtualCard.HostCollectiveId);
+        }
+      },
+    },
+    assignee: {
+      type: GraphQLIndividual,
+      async resolve(virtualCard, _, req) {
+        if (!virtualCard.UserId) {
+          return null;
+        }
+
+        const user = await req.loaders.User.byId.load(virtualCard.UserId);
+        if (user && user.CollectiveId) {
+          const collective = await req.loaders.Collective.byId.load(user.CollectiveId);
+          if (collective && !collective.isIncognito) {
+            return collective;
+          }
+        }
+      },
+    },
+    name: {
+      type: GraphQLString,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          return virtualCard.name;
+        }
+      },
+    },
+    last4: {
+      type: GraphQLString,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          return virtualCard.last4;
+        }
+      },
+    },
+    data: {
+      type: GraphQLJSONObject,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          return virtualCard.data;
+        }
+      },
+    },
+    status: {
+      type: GraphQLVirtualCardStatusEnum,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          return virtualCard.data.status;
+        }
+      },
+    },
+    privateData: {
+      type: GraphQLJSONObject,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          return virtualCard.get('privateData');
+        }
+      },
+    },
+    provider: { type: GraphQLString },
+    spendingLimitAmount: {
+      type: GraphQLInt,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          return virtualCard.spendingLimitAmount;
+        }
+      },
+    },
+    spendingLimitInterval: {
+      type: GraphQLVirtualCardLimitInterval,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          return virtualCard.spendingLimitInterval;
+        }
+      },
+    },
+    spendingLimitRenewsOn: {
+      type: GraphQLDateTime,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          const { spendingLimitInterval } = virtualCard;
+
+          const { renewsOn } = getSpendingLimitIntervalDates(spendingLimitInterval as VirtualCardLimitIntervals);
+
+          return renewsOn;
+        }
+      },
+    },
+    remainingLimit: {
+      type: GraphQLInt,
+      async resolve(virtualCard, _, req) {
+        if (await canSeeVirtualCardPrivateInfo(req, virtualCard)) {
+          const { spendingLimitAmount, spendingLimitInterval } = virtualCard;
+
+          if (spendingLimitInterval === VirtualCardLimitIntervals.PER_AUTHORIZATION) {
+            return spendingLimitAmount;
+          }
+
+          const { renewedOn } = getSpendingLimitIntervalDates(spendingLimitInterval as VirtualCardLimitIntervals);
+
+          const sumExpensesInPeriod = await models.Expense.sum('amount', {
+            where: {
+              VirtualCardId: virtualCard.id,
+              status: [ExpenseStatus.PROCESSING, ExpenseStatus.PAID],
+              ...(renewedOn && { incurredAt: { [Op.gte]: renewedOn } }),
+            },
+          });
+
+          return spendingLimitAmount - sumExpensesInPeriod;
+        }
+      },
+    },
+    currency: { type: GraphQLCurrency },
+    virtualCardRequest: {
+      type: GraphQLVirtualCardRequest,
+      resolve(virtualCard: VirtualCard, _: void, req: Express.Request) {
+        if (!virtualCard.VirtualCardRequestId) {
+          return null;
+        }
+        return req.loaders.VirtualCardRequest.byId.load(virtualCard.VirtualCardRequestId);
+      },
+    },
+    createdAt: { type: GraphQLDateTime },
+    updatedAt: { type: GraphQLDateTime },
+  }),
+});

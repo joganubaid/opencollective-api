@@ -1,0 +1,109 @@
+Subject: {{{collective.name}}} wants to be hosted by {{{host.name}}}
+
+{{> header}}
+
+<div class="hidden">Request submitted by {{user.collective.name}}</div>
+
+<h1>{{collective.name}}</h1>
+
+<style>
+  th {
+    text-align: left;
+  }
+</style>
+
+Dear admin of {{host.name}},
+
+<p>
+  {{user.collective.name}} wants their Collective, {{collective.name}}, to join your Fiscal Host. If you approve this application, you agree to hold and account for money on their behalf.
+
+<p>{{host.name}} charges a default Host Fee of {{host.hostFeePercent}}%. You can edit your default Host Fee <a href="{{config.host.website}}/dashboard/{{host.slug}}/fiscal-hosting">in your settings</a>, or set a custom fee per Collective in the Hosted Collectives area of <a href="{{config.host.website}}/dashboard/{{host.slug}}/hosted-collectives">your Host Dashboard</a>. Or read more <a href="https://documentation.opencollective.com/fiscal-hosts/fiscal-hosts">about Fiscal Hosting</a>.</p>
+
+<h2>Collective details</h2>
+<table>
+  <tr>
+    <th>Name</th>
+    <td>{{collective.name}}</td>
+  </tr>
+  {{#unless collective.isPrivate}}
+    <tr>
+      <th>Public profile</th>
+      <td><a href="{{accountUrl collective}}">{{accountUrl collective}}</a></td>
+    </tr>
+  {{/unless}}
+  {{#if collective.website}}
+  <tr>
+    <th>Website</th>
+    <td>{{collective.website}}</td>
+  </tr>
+  {{/if}}
+  {{#if collective.data.members}}
+  <tr>
+    <th>Members</th>
+    <td>{{collective.data.members}}</td>
+  </tr>
+  {{/if}}
+  {{#if collective.twitterHandle}}
+  <tr>
+    <th>Twitter</th>
+    <td>{{collective.twitterHandle}}</td>
+  </tr>
+  {{/if}}
+  <tr>
+    <th>Description</th>
+    <td>{{collective.description}}</td>
+  </tr>
+  <tr>
+    <th>Tags</th>
+    <td>{{json collective.tags}}</td>
+  </tr>
+  {{#if application.customData}}
+    {{#each application.customData}}
+      <tr>
+        <th style="min-width: 115px;">{{prettifyVariableName @key}}</th>
+        <td>{{this}}</td>
+      </tr>
+    {{/each}}
+  {{/if}}
+</table>
+
+{{#if application.message}}
+  <h2>Message</h2>
+  <p>
+    <blockquote style="color: #6a737d;font-size: 14px;text-align: left;padding: 0.5em 0.75em;margin: 1em 0;border-left: 3px solid #e4e4e4;white-space: pre-line;">{{application.message}}</blockquote>
+  </p>
+{{/if}}
+
+<h2>Creator</h2>
+<a href="{{accountUrl user.collective}}">{{accountUrl user.collective}}</a>
+<br /><br />
+<table>
+  <tr>
+    <th>Name</th>
+    <td>{{user.collective.name}}</td>
+  </tr>
+  <tr>
+    <th>Email</th>
+    <td>{{user.email}}</td>
+  </tr>
+  <tr>
+    <th>Website</th>
+    <td>{{user.collective.website}}</td>
+  </tr>
+  <tr>
+    <th>Twitter</th>
+    <td>{{user.collective.twitterHandle}}</td>
+  </tr>
+</table>
+
+<br /><br />
+<center>
+  <a
+    class="btn blue"
+    href="{{dashboardUrl host 'host-applications'}}?accountId={{collective.id}}"
+  >
+    <div style="font-size: 15px;">View application</div>
+  </a>
+</center>
+
+{{> footer}}

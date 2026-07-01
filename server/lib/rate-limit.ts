@@ -1,0 +1,76 @@
+import config from 'config';
+
+import { sessionCache } from './cache';
+import logger from './logger';
+import { parseToBoolean } from './utils';
+
+export const ONE_HOUR_IN_SECONDS = 60 * 60;
+
+const isTestEnvironment =
+  process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'ci' || config.env === 'e2e' || config.env === 'ci';
+const DISABLE_RATE_LIMITING = parseToBoolean(process.env.DISABLE_RATE_LIMITING);
+
+/**
+ * A small wrapper around the cache specialized to handle rate limitings.
+ */
+export default class RateLimit {
+  private cacheKey: string;
+  private limit: number;
+  private expiryTimeInSeconds: number;
+  private ignoreTests: boolean;
+
+  constructor(cacheKey: string, limit: number, expiryTimeInSeconds: number = ONE_HOUR_IN_SECONDS, ignoreTests = false) {
+    this.cacheKey = cacheKey;
+    this.limit = limit;
+    this.expiryTimeInSeconds = expiryTimeInSeconds;
+    this.ignoreTests = ignoreTests;
+  }
+
+  /** Load the count from cache if required and check if the limit has been reached */
+  public async hasReachedLimit(): Promise<boolean> {
+    if (this.ignoreTests && isTestEnvironment) {
+      return false;
+    } else if (DISABLE_RATE_LIMITING) {
+      logger.debug(`Rate limiting is disabled`);
+      return false;
+    }
+
+    const count = await this.getCallsCount();
+    return count >= this.limit;
+  }
+
+  /** Register `nbCalls` in the cache. Returns false if limit has been reached. */
+  public async registerCall(nbCalls = 1): Promise<boolean> {
+    if (this.ignoreTests && isTestEnvironment) {
+      return true;
+    } else if (DISABLE_RATE_LIMITING) {
+      logger.debug(`Rate limiting is disabled`);
+      return true;
+    }
+
+    const count = await this.getCallsCount();
+    if (count >= this.limit) {
+      return false;
+    } else {
+      await sessionCache.set(this.cacheKey, count + nbCalls, this.expiryTimeInSeconds);
+      return true;
+    }
+  }
+
+  // Same as registerCall but throws an error if the limit has been reached
+  public async registerCallOrThrow(nbCalls = 1): Promise<void> {
+    if (!(await this.registerCall(nbCalls))) {
+      throw new Error('Rate limit reached');
+    }
+  }
+
+  /** Resets the limit */
+  public async reset() {
+    return sessionCache.delete(this.cacheKey);
+  }
+
+  /** Load existing count from cache returns it */
+  public async getCallsCount(): Promise<number> {
+    return (await sessionCache.get(this.cacheKey)) || 0;
+  }
+}

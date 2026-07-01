@@ -1,0 +1,37 @@
+Subject: {{{remoteUser.collective.name}}} added you as {{role}} to {{{collective.name}}} on Open Collective
+
+{{> header}}
+
+{{> toplogo}}
+
+<p>{{> greeting}}</p>
+
+<p>{{remoteUser.collective.name}} (cced) added you as {{role}} for <a href="{{accountUrl collective}}">{{collective.name}}</a> on Open Collective.</p>
+
+{{#if isAdmin }}
+<p>As an administrator, you can <a href="{{config.host.website}}/dashboard/{{collective.slug}}">edit the settings</a> and add or remove team members.</p>
+{{else}}
+<p>You are now listed as a team member on <a href="{{accountUrl collective}}">{{collective.name}}</a>.</p>
+{{/if}}
+
+<h2>Your details:</h2>
+
+<table>
+  {{#if recipient.collective.previewImage}}
+    <tr><th>Avatar:</th><td><img src="{{recipient.collective.previewImage}}" height="64" /></td></tr>
+  {{else}}
+  <tr><th>Avatar:</th><td>No avatar</td></tr>
+  {{/if}}
+  <tr><th>Name:</th><td>{{recipient.collective.name}}</td></tr>
+  <tr><th>Short description:</th><td>{{recipient.collective.description}}</td></tr>
+  {{#if recipient.collective.website}}
+  <tr><th>Website:</th><td>{{recipient.collective.website}}</td></tr>
+  {{/if}}
+  {{#if recipient.collective.twitterHandle}}
+  <tr><th>Twitter:</th><td>{{recipient.collective.twitterHandle}}</td></tr>
+  {{/if}}
+</table>
+
+<p>If you have questions, feel free to reply to this email.</p>
+
+{{> footer}}

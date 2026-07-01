@@ -1,0 +1,64 @@
+import { GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLNonEmptyString } from 'graphql-scalars';
+
+import { EntityShortIdPrefix, isEntityMigratedToPublicId } from '../../../lib/permalink/entity-map';
+import { Expense } from '../../../models';
+import { ExpenseDataValuesRoleDetails } from '../../../models/Expense';
+import { idEncode, IDENTIFIER_TYPES } from '../identifiers';
+
+import { GraphQLAccountingCategory } from './AccountingCategory';
+
+const GraphQLExpenseValuesRoleDetails = new GraphQLObjectType({
+  name: 'ExpenseValuesRoleDetails',
+  fields: () => ({
+    accountingCategory: {
+      type: GraphQLAccountingCategory,
+      resolve: async (data: ExpenseDataValuesRoleDetails, _, req) => {
+        // Try to load the accounting category from the DB, fallback to the value stored in data (in case it was deleted)
+        if (data?.accountingCategory?.id) {
+          return req.loaders.AccountingCategory.byId.load(data.accountingCategory.id);
+        }
+      },
+    },
+  }),
+});
+
+export const GraphQLExpenseValuesByRole = new GraphQLObjectType({
+  name: 'ExpenseValuesByRole',
+  fields: () => ({
+    id: {
+      type: new GraphQLNonNull(GraphQLNonEmptyString),
+      resolve: (expense: Expense) => {
+        if (isEntityMigratedToPublicId(EntityShortIdPrefix.Expense, expense.createdAt)) {
+          return expense.publicId;
+        } else {
+          return idEncode(expense.id, IDENTIFIER_TYPES.EXPENSE);
+        }
+      },
+    },
+    publicId: {
+      type: new GraphQLNonNull(GraphQLString),
+      description: `The resource public id (ie: ${EntityShortIdPrefix.Expense}_xxxxxxxx)`,
+    },
+    submitter: {
+      type: GraphQLExpenseValuesRoleDetails,
+      description: 'The values provided by the expense submitter(s)',
+      resolve: (expense: Expense) => expense.data?.valuesByRole?.submitter,
+    },
+    accountAdmin: {
+      type: GraphQLExpenseValuesRoleDetails,
+      description: 'The values provided by the account admin(s)',
+      resolve: (expense: Expense) => expense.data?.valuesByRole?.collectiveAdmin,
+    },
+    hostAdmin: {
+      type: GraphQLExpenseValuesRoleDetails,
+      description: 'The values provided by the host admin(s)',
+      resolve: (expense: Expense) => expense.data?.valuesByRole?.hostAdmin,
+    },
+    prediction: {
+      type: GraphQLExpenseValuesRoleDetails,
+      description: 'The values provided by the prediction service',
+      resolve: (expense: Expense) => expense.data?.valuesByRole?.prediction,
+    },
+  }),
+});

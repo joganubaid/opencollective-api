@@ -1,0 +1,152 @@
+import '../../server/env';
+
+import { QueryTypes } from 'sequelize';
+
+import logger from '../../server/lib/logger';
+import { sequelize } from '../../server/models';
+
+import { runAllChecksThenExit } from './_utils';
+
+async function checkHostFeePercent({ fix = false } = {}) {
+  const message = 'Host without hostFeePercent';
+
+  const results = await sequelize.query<{ count: number }>(
+    `
+     SELECT COUNT(*) as count
+     FROM "Collectives"
+     WHERE "deletedAt" IS NULL
+     AND "hostFeePercent" IS NULL
+     AND "hasMoneyManagement" IS TRUE
+     AND "type" IN ('ORGANIZATION', 'USER')
+    `,
+    { type: QueryTypes.SELECT, raw: true },
+  );
+
+  if (results[0].count > 0) {
+    if (!fix) {
+      throw new Error(message);
+    } else {
+      logger.warn(`Fixing: ${message}`);
+      await sequelize.query(`
+        UPDATE "Collectives"
+         SET "hostFeePercent" = 0
+         WHERE "deletedAt" IS NULL
+         AND "hostFeePercent" IS NULL
+         AND "hasMoneyManagement" IS TRUE
+         AND "type" IN ('ORGANIZATION', 'USER')
+      `);
+    }
+  }
+}
+
+async function checkHostMemberEntry({ fix = false } = {}) {
+  const message = 'No Collective with approved host without host member entry';
+
+  const results = await sequelize.query<{ count: number }>(
+    `
+     SELECT COUNT(*) as count
+     FROM "Collectives"
+     WHERE "HostCollectiveId" IS NOT NULL
+     AND "approvedAt" IS NOT NULL
+     AND "isActive" IS TRUE
+     AND "deletedAt" IS NULL
+     AND "HostCollectiveId" != "Collectives"."id"
+     AND NOT EXISTS (
+       SELECT * FROM "Members"
+       WHERE "CollectiveId" = "Collectives"."id"
+       AND "role" = 'HOST'
+       AND "deletedAt" IS NULL
+     )
+     AND EXISTS (
+       SELECT * FROM "Collectives" c2
+       WHERE "Collectives"."id" = c2."HostCollectiveId"
+       AND c2."deletedAt" IS NULL
+     )
+    `,
+    { type: QueryTypes.SELECT, raw: true },
+  );
+
+  if (results[0].count > 0) {
+    if (!fix) {
+      throw new Error(message);
+    } else {
+      logger.warn(`Fixing: ${message}`);
+      await sequelize.query(`
+        INSERT INTO "Members" (
+           "createdAt",
+           "updatedAt",
+           "CreatedByUserId",
+           "CollectiveId",
+           "role",
+           "MemberCollectiveId",
+           "since"
+         )
+         SELECT
+         NOW() as "createdAt",
+         NOW() as "updatedAt",
+         12457 as "CreatedByUserId",
+         "Collectives"."id" as "CollectiveId",
+         'HOST' as "role",
+         "Collectives"."HostCollectiveId" as "MemberCollectiveId",
+         "approvedAt" as "since"
+         FROM "Collectives"
+         WHERE "HostCollectiveId" IS NOT NULL
+         AND "approvedAt" IS NOT NULL
+         AND "isActive" IS TRUE
+         AND "deletedAt" IS NULL
+         AND "HostCollectiveId" != "Collectives"."id"
+         AND NOT EXISTS (
+           SELECT * FROM "Members"
+           WHERE "CollectiveId" = "Collectives"."id"
+           AND "role" = 'HOST'
+           AND "deletedAt" IS NULL
+         )
+         AND EXISTS (
+           SELECT * FROM "Collectives" c2
+           WHERE "Collectives"."id" = c2."HostCollectiveId"
+           AND c2."deletedAt" IS NULL
+         )
+      `);
+    }
+  }
+}
+
+async function checkHostActive({ fix = false } = {}) {
+  const message = 'Host with isActive=false';
+
+  const results = await sequelize.query<{ count: number }>(
+    `
+     SELECT COUNT(*) as count
+     FROM "Collectives"
+     WHERE "hasMoneyManagement" IS TRUE
+     AND "deletedAt" IS NULL AND "deactivatedAt" IS NULL
+     AND "approvedAt" IS NOT NULL AND "HostCollectiveId" = "id"
+     AND "isActive" IS FALSE
+     AND COALESCE(("settings"->'forceHostAccountInactive')::boolean, false) IS FALSE
+    `,
+    { type: QueryTypes.SELECT, raw: true },
+  );
+
+  if (results[0].count > 0) {
+    if (!fix) {
+      throw new Error(message);
+    } else {
+      logger.warn(`Fixing: ${message}`);
+      await sequelize.query(`
+        UPDATE "Collectives"
+         SET "isActive" = TRUE
+         WHERE "hasMoneyManagement" IS TRUE
+         AND "deletedAt" IS NULL AND "deactivatedAt" IS NULL
+         AND "approvedAt" IS NOT NULL AND "HostCollectiveId" = "id"
+         AND "isActive" IS FALSE
+         AND COALESCE(("settings"->'forceHostAccountInactive')::boolean, false) IS FALSE
+      `);
+    }
+  }
+}
+
+export const checks = [checkHostFeePercent, checkHostMemberEntry, checkHostActive];
+
+if (!module.parent) {
+  runAllChecksThenExit(checks);
+}

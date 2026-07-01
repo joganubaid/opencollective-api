@@ -1,0 +1,33 @@
+Subject: Action required: Submit tax form for {{{accountName}}}
+
+{{> header}}
+
+{{#if recipientName}}
+<p>Hi {{recipientName}},</p>
+{{else}}
+<p>Hi,</p>
+{{/if}}
+
+<p>
+  You recently submitted an expense on Open Collective that requires more information before it can be paid. United States
+  regulations require US entities to collect certain information from payees for tax reporting purposes,
+  even if the payee is outside the US.
+</p>
+<p>
+  The button below will take you to your dashboard, where you can fill out your tax information.
+</p>
+
+<p>
+  If you have any questions, please read 
+  <a href="https://documentation.opencollective.com/expenses-and-getting-paid/understanding-tax-requirements">our documentation</a>
+  or <a href="{{config.host.website}}/contact">contact us</a>.
+</p>
+
+<div style="text-align: center; margin: 32px 0;">
+  <a class="btn blue" href="{{config.host.website}}/dashboard/{{collective.slug}}/tax-information">
+    Submit tax form
+  </a>
+</div>
+
+
+{{> footer}}

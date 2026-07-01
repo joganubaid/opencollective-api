@@ -1,0 +1,555 @@
+import assert from 'assert';
+
+import Debug from 'debug';
+import { Request } from 'express';
+import { get, toNumber } from 'lodash';
+import moment from 'moment';
+
+import FEATURE from '../../constants/feature';
+import OrderStatus from '../../constants/order-status';
+import { PAYMENT_METHOD_SERVICE } from '../../constants/paymentMethods';
+import { TransactionKind } from '../../constants/transaction-kind';
+import { TransactionTypes } from '../../constants/transactions';
+import { floatAmountToCents } from '../../lib/currency';
+import logger from '../../lib/logger';
+import { createRefundTransaction, pauseOrderInDb } from '../../lib/payments';
+import { validateWebhookEvent, WatchedPaypalWebhookEvent } from '../../lib/paypal';
+import { recordOrderProcessed } from '../../lib/recurring-contributions';
+import { reportErrorToSentry, reportMessageToSentry } from '../../lib/sentry';
+import models from '../../models';
+import { PayoutWebhookRequest, PaypalCapture } from '../../types/paypal';
+
+import { paypalRequestV2 } from './api';
+import { findTransactionByPaypalId, recordPaypalCapture, recordPaypalSale } from './payment';
+import { checkBatchItemStatus } from './payouts';
+import { CANCEL_PAYPAL_EDITED_SUBSCRIPTION_REASON, CONTRIBUTION_PAUSED_MSG } from './subscription';
+
+const debug = Debug('paypal:webhook');
+
+const getPaypalAccount = async host => {
+  if (!host) {
+    throw new Error('PayPal webhook: no host found');
+  }
+
+  return host.getAccountForPaymentProvider('paypal');
+};
+
+// Kept exported for https://github.com/opencollective/opencollective/issues/8789 - wire into EventHandlers when enabling webhook-driven payout sync (cron currently handles this).
+// ts-unused-exports:disable-next-line
+export async function handlePayoutTransactionUpdate(req: Request): Promise<void> {
+  const event = req.body as PayoutWebhookRequest;
+  const expense = await models.Expense.findOne({
+    where: { id: toNumber(event.resource.payout_item.sender_item_id) },
+    include: [{ model: models.Collective, as: 'collective' }],
+  });
+
+  if (!expense) {
+    // This is probably some other transfer not executed through our platform.
+    debug('event does not match any expense, ignoring');
+    return;
+  }
+
+  const host = await expense.collective.getHostCollective();
+  if (!host) {
+    throw new Error(`No host found for collective ${expense.collective.slug}`);
+  }
+
+  const paypalAccount = await getPaypalAccount(host);
+  await validateWebhookEvent(paypalAccount, req);
+
+  const item = event.resource;
+  await checkBatchItemStatus(item, expense, host);
+}
+
+/**
+ * From a Webhook event + a subscription ID, returns the associated order along with the
+ * host and PayPal account. Calls `validateWebhookEvent`, throwing if the webhook event is invalid
+ */
+const loadSubscriptionForWebhookEvent = async (
+  req: Request,
+  subscriptionId: string,
+  { throwIfMissing = true } = {},
+) => {
+  const hostId = parseInt(req.params.hostId);
+  const order = await models.Order.findOne({
+    include: [
+      { association: 'fromCollective', required: false },
+      { association: 'createdByUser', required: false },
+      { association: 'collective', required: true, where: { HostCollectiveId: hostId } },
+      {
+        association: 'Subscription',
+        required: true,
+        where: { paypalSubscriptionId: subscriptionId },
+      },
+      {
+        association: 'paymentMethod',
+        required: true,
+        where: { service: 'paypal', type: 'subscription' },
+      },
+    ],
+  });
+
+  if (!order) {
+    if (throwIfMissing) {
+      throw new Error(`No order found for subscription ${subscriptionId}`);
+    } else {
+      return null;
+    }
+  } else if (order.isLocked()) {
+    throw new Error('This order is already been processed, please try again later');
+  }
+
+  const host = await order.collective.getHostCollective();
+  if (!host) {
+    throw new Error(`No host found for collective ${order.collective.slug}`);
+  }
+
+  const paypalAccount = await getPaypalAccount(host);
+  await validateWebhookEvent(paypalAccount, req);
+  return { host, order, paypalAccount };
+};
+
+async function handleSaleCompleted(req: Request): Promise<void> {
+  // 1. Retrieve the order for this subscription & validate webhook event
+  const sale = req.body.resource;
+  const subscriptionId = sale.billing_agreement_id;
+  if (!subscriptionId) {
+    // Direct charge (not recurring) - ignoring
+    return;
+  }
+
+  // 2. Lock & process the order
+  let transaction;
+  const { order } = await loadSubscriptionForWebhookEvent(req, subscriptionId);
+  await order.lock(async () => {
+    // 2.1 Make sure the sale hasn't already been recorded
+    const existingTransaction = await findTransactionByPaypalId(sale.id, { OrderId: order.id });
+    if (existingTransaction) {
+      logger.debug(`PayPal: Transaction for sale ${sale.id} already recorded, ignoring`);
+      return;
+    }
+
+    // 2.2 Record the transaction
+    transaction = await recordPaypalSale(order, sale);
+
+    // 2.3 Mark order/subscription as active
+    if (order.status !== OrderStatus.ACTIVE) {
+      await order.update({ status: OrderStatus.ACTIVE, processedAt: new Date() });
+    }
+
+    const nextChargeDate = moment().add(1, order.interval);
+    await order.Subscription.update({
+      chargeNumber: (order.Subscription.chargeNumber || 0) + 1,
+      nextChargeDate: nextChargeDate,
+      nextPeriodStart: nextChargeDate,
+      isActive: true,
+      activatedAt: order.Subscription.activatedAt || new Date(),
+      lastChargedAt: transaction.clearedAt || transaction.createdAt,
+    });
+  });
+
+  // 3. Send "Thank you" (order.processed) email & record activity
+  const isFirstPayment = order.Subscription.chargeNumber === 1;
+  await recordOrderProcessed(order, transaction, { isFirstPayment });
+
+  // 4. Register user as a member, since the transaction is not created in `processOrder`
+  // for PayPal subscriptions.
+  await order.getOrCreateMembers();
+}
+
+async function handleCaptureCompleted(req: Request): Promise<void> {
+  const hostId = parseInt(req.params.hostId);
+
+  // Retrieve the order for this event
+  const capture = req.body.resource;
+  const order = await models.Order.findOne({
+    where: {
+      status: OrderStatus.NEW,
+      data: { paypalCaptureId: capture.id },
+    },
+    include: [
+      { association: 'fromCollective' },
+      { association: 'createdByUser' },
+      { association: 'collective', required: true, where: { HostCollectiveId: hostId } },
+      {
+        association: 'paymentMethod',
+        required: true,
+        where: { service: 'paypal', type: 'payment' },
+      },
+    ],
+  });
+
+  if (!order) {
+    logger.debug(`No pending order found for capture ${capture.id}`);
+    return;
+  } else if (order.isLocked()) {
+    throw new Error('This order is already been processed, please try again later');
+  }
+
+  // Validate webhook event
+  const host = await order.collective.getHostCollective();
+  if (!host) {
+    throw new Error(`No host found for collective ${order.collective.slug}`);
+  }
+
+  const paypalAccount = await getPaypalAccount(host);
+  await validateWebhookEvent(paypalAccount, req);
+
+  let transaction;
+  await order.lock(async () => {
+    // Make sure the transaction is not already recorded
+    const existingTransaction = await models.Transaction.findOne({
+      where: {
+        OrderId: order.id,
+        data: { paypalCaptureId: capture.id },
+      },
+    });
+
+    if (existingTransaction) {
+      logger.debug(`Transaction for PayPal capture ${capture.id} already exists`);
+      return;
+    }
+
+    // Record the transaction
+    transaction = await recordPaypalCapture(order, capture);
+    await order.update({ processedAt: new Date(), status: OrderStatus.PAID });
+  });
+
+  await Promise.all([
+    // Register user as a member, since the transaction is not created in `processOrder`
+    order.getOrCreateMembers(),
+    // Send "Thank you" (order.processed) email & record activity
+    recordOrderProcessed(order, transaction),
+  ]);
+}
+
+/**
+ * Shared lookup for sale-based refund/reversal events.
+ * Returns the matching CREDIT CONTRIBUTION transaction or null.
+ */
+async function findSaleTransaction(saleId: string) {
+  return models.Transaction.findOne({
+    where: {
+      type: TransactionTypes.CREDIT,
+      kind: TransactionKind.CONTRIBUTION,
+      isRefund: false,
+      RefundTransactionId: null,
+      data: { paypalCaptureId: saleId },
+    },
+    include: [
+      {
+        model: models.PaymentMethod,
+        required: true,
+        where: { service: PAYMENT_METHOD_SERVICE.PAYPAL },
+      },
+      {
+        model: models.Order,
+        required: true,
+        include: [{ association: 'collective', required: true }],
+      },
+    ],
+  });
+}
+
+/**
+ * Handles `PAYMENT.SALE.REFUNDED` (merchant-initiated refund on a subscription sale).
+ * resource = Refund object; `resource.sale_id` identifies the original sale.
+ */
+async function handleSaleRefunded(req: Request): Promise<void> {
+  const refund = req.body.resource;
+  const saleId = refund.sale_id;
+  if (!saleId) {
+    logger.debug('PayPal: PAYMENT.SALE.REFUNDED - no sale_id in resource, ignoring');
+    return;
+  }
+
+  const transaction = await findSaleTransaction(saleId);
+  if (!transaction) {
+    logger.debug(`PayPal: Refund - No transaction found for sale ${saleId}`);
+    return;
+  } else if (transaction.data?.isRefundedFromOurSystem) {
+    return;
+  } else if (transaction.Order.isLocked()) {
+    throw new Error('This order is already been processed, please try again later');
+  }
+
+  const host = await transaction.Order.collective.getHostCollective();
+  if (!host) {
+    throw new Error(`No host found for collective ${transaction.Order.collective.slug}`);
+  }
+
+  const paypalAccount = await getPaypalAccount(host);
+  await validateWebhookEvent(paypalAccount, req);
+
+  await transaction.Order.lock(async () => {
+    const reloadedTransaction = await models.Transaction.findByPk(transaction.id);
+    if (reloadedTransaction.data.isRefundedFromOurSystem || reloadedTransaction.RefundTransactionId) {
+      return;
+    }
+
+    const rawRefundedPaypalFee = <string>get(refund, 'transaction_fee.value', '0.00');
+    const refundedPaypalFee = floatAmountToCents(parseFloat(rawRefundedPaypalFee));
+    await createRefundTransaction(
+      transaction,
+      refundedPaypalFee,
+      { paypalResponse: refund, isRefundedFromPayPal: true },
+      null,
+    );
+  });
+}
+
+/**
+ * Handles `PAYMENT.SALE.REVERSED` (chargeback / reversal on a subscription sale).
+ * resource = Sale object in reversed state; `resource.id` is the original sale ID.
+ */
+async function handleSaleReversed(req: Request): Promise<void> {
+  const sale = req.body.resource;
+  const saleId = sale?.id;
+  if (!saleId) {
+    logger.debug('PayPal: PAYMENT.SALE.REVERSED - no id in resource, ignoring');
+    return;
+  }
+
+  const transaction = await findSaleTransaction(saleId);
+  if (!transaction) {
+    logger.debug(`PayPal: Reversal - No transaction found for sale ${saleId}`);
+    return;
+  } else if (transaction.data?.isRefundedFromOurSystem) {
+    return;
+  } else if (transaction.Order.isLocked()) {
+    throw new Error('This order is already been processed, please try again later');
+  }
+
+  const host = await transaction.Order.collective.getHostCollective();
+  if (!host) {
+    throw new Error(`No host found for collective ${transaction.Order.collective.slug}`);
+  }
+
+  const paypalAccount = await getPaypalAccount(host);
+  await validateWebhookEvent(paypalAccount, req);
+
+  await transaction.Order.lock(async () => {
+    const reloadedTransaction = await models.Transaction.findByPk(transaction.id);
+    if (reloadedTransaction.data.isRefundedFromOurSystem || reloadedTransaction.RefundTransactionId) {
+      return;
+    }
+
+    await createRefundTransaction(transaction, 0, { paypalResponse: sale, isRefundedFromPayPal: true }, null);
+  });
+}
+
+async function handleCaptureRefunded(req: Request): Promise<void> {
+  // Validate webhook event
+  const host = await models.Collective.findByPk(req.params.hostId);
+  if (!host) {
+    throw new Error(`No host found for ID ${req.params.hostId}`);
+  }
+
+  const paypalAccount = await getPaypalAccount(host);
+  await validateWebhookEvent(paypalAccount, req);
+
+  // Retrieve the data for this event
+  const refund = req.body.resource;
+  const refundDetails = await paypalRequestV2(`payments/refunds/${refund.id}`, host, 'GET');
+  const refundLinks = <Record<string, string>[]>refundDetails.links;
+  const captureLink = refundLinks.find(l => l.rel === 'up' && l.method === 'GET');
+  const capturePath = captureLink.href.replace(/^.+\/v2\//, ''); // https://api.sandbox.paypal.com/v2/payments/captures/... -> payments/captures/...
+  const captureDetails = (await paypalRequestV2(capturePath, host, 'GET')) as PaypalCapture;
+
+  // Load associated transaction, make sure they're not refunded already
+  const transaction = await models.Transaction.findOne({
+    where: {
+      type: TransactionTypes.CREDIT,
+      kind: TransactionKind.CONTRIBUTION,
+      isRefund: false,
+      RefundTransactionId: null,
+      data: { paypalCaptureId: captureDetails.id },
+    },
+    include: [
+      {
+        model: models.PaymentMethod,
+        required: true,
+        where: { service: PAYMENT_METHOD_SERVICE.PAYPAL },
+      },
+      {
+        model: models.Order,
+        required: true,
+        include: [{ association: 'collective', required: true }],
+      },
+    ],
+  });
+
+  if (!transaction) {
+    logger.debug(`PayPal: Refund - No transaction found for capture ${captureDetails.id}`);
+    return;
+  } else if (transaction.data?.isRefundedFromOurSystem) {
+    // Ignore
+    return;
+  } else if (transaction.Order.isLocked()) {
+    throw new Error('This order is already been processed, please try again later');
+  }
+
+  await transaction.Order.lock(async () => {
+    // Reload the transaction to make sure it hasn't been refunded already in the meantime
+    const reloadedTransaction = await models.Transaction.findByPk(transaction.id);
+    if (reloadedTransaction.data.isRefundedFromOurSystem || reloadedTransaction.RefundTransactionId) {
+      return;
+    }
+
+    // Record the refund transactions
+    const rawRefundedPaypalFee = <string>get(refundDetails, 'seller_payable_breakdown.paypal_fee.value', '0.00');
+    const refundedPaypalFee = floatAmountToCents(parseFloat(rawRefundedPaypalFee));
+    const dataPayload = { paypalResponse: refundDetails, isRefundedFromPayPal: true };
+    await createRefundTransaction(transaction, refundedPaypalFee, dataPayload, null);
+  });
+}
+
+/**
+ * Handles `BILLING.SUBSCRIPTION.CANCELLED` (users cancelling their subscription through PayPal's UI) by marking order as cancelled.
+ */
+async function handleSubscriptionCancelled(req: Request): Promise<void> {
+  const subscription = req.body.resource;
+  if (subscription['status_change_note'] === CANCEL_PAYPAL_EDITED_SUBSCRIPTION_REASON) {
+    // Ignore, this is a subscription that was updated by the user through the edit subscription page
+    return;
+  }
+
+  const result = await loadSubscriptionForWebhookEvent(req, subscription.id, { throwIfMissing: false });
+  if (!result) {
+    // It's fine to ignore this event: if we can't find the subscription, it's probably because it was
+    // already updated with a new plan or payment method. We still log it for debugging purposes.
+    reportMessageToSentry(`No order found while cancelling PayPal subscription`, {
+      feature: FEATURE.PAYPAL_DONATIONS,
+      severity: 'warning',
+      extra: { body: req.body },
+    });
+    return;
+  }
+
+  const { order } = result;
+  if (order.status !== OrderStatus.CANCELLED) {
+    const shouldKeepPaused = subscription.status_change_note === CONTRIBUTION_PAUSED_MSG;
+    await order.update({
+      status: order.status === OrderStatus.PAUSED && shouldKeepPaused ? OrderStatus.PAUSED : OrderStatus.CANCELLED,
+      data: { ...order.data, paypalStatusChangeNote: subscription.status_change_note },
+    });
+  }
+
+  if (order.Subscription.isActive || !order.Subscription.deactivatedAt) {
+    await order.Subscription.update({
+      isActive: false,
+      deactivatedAt: new Date(),
+      nextChargeDate: null,
+      data: { ...order.Subscription.data, deactivatedFromPayPalWebhook: true },
+    });
+  }
+}
+
+/**
+ * Handles `BILLING.SUBSCRIPTION.SUSPENDED` (subscription "paused") by marking order as paused.
+ */
+async function handleSubscriptionSuspended(req: Request): Promise<void> {
+  const subscription = req.body.resource;
+  if (subscription['status_change_note'] === CANCEL_PAYPAL_EDITED_SUBSCRIPTION_REASON) {
+    // Ignore, this is a subscription that was updated by the user through the edit subscription page
+    return;
+  }
+
+  const result = await loadSubscriptionForWebhookEvent(req, subscription.id, { throwIfMissing: false });
+  if (!result) {
+    // It's fine to ignore this event: if we can't find the subscription, it's probably because it was
+    // already updated with a new plan or payment method. We still log it for debugging purposes.
+    reportMessageToSentry(`No order found while suspending PayPal subscription`, {
+      feature: FEATURE.PAYPAL_DONATIONS,
+      severity: 'warning',
+      extra: { body: req.body },
+    });
+    return;
+  }
+
+  const { order } = result;
+  if (order.status !== OrderStatus.PAUSED) {
+    await pauseOrderInDb(order, subscription.status_change_note, 'USER');
+  }
+}
+
+async function handleSubscriptionActivated(req: Request): Promise<void> {
+  const subscription = req.body.resource;
+  const email = subscription.subscriber?.email_address;
+  if (email) {
+    const { order } = await loadSubscriptionForWebhookEvent(req, subscription.id);
+    if (order.paymentMethod.name !== email) {
+      await order.paymentMethod.update({ name: email });
+    }
+  }
+}
+
+/**
+ * We are currenttly reviewing some PayPal webhooks that are watched but not handled.
+ */
+const ignoreWebhookEvent = (req: Request): Promise<void> => {
+  logger.debug(`PayPal: Unhandled event ${req.body.event_type}, ignoring`);
+  return Promise.resolve();
+};
+
+const EventHandlers: Record<WatchedPaypalWebhookEvent, (req: Request) => Promise<void>> = {
+  // These payout events are all ignored, especially since https://github.com/opencollective/opencollective-api/commit/641ce51e57e818530571e86d23d54b292bee52a8#diff-439d2ae7fe1dcbd7d538ed0df2359e38309366f6a9785f9e7ebc297e5e0a7068
+  // opencollective-api/cron/hourly/11-check-pending-paypal-expenses.js is handling the sync, so data should still be up-to-date
+  // Handling them would allow for faster sync: https://github.com/opencollective/opencollective/issues/8789
+  [WatchedPaypalWebhookEvent.PAYOUTS_BATCH_DENIED]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_BATCH_PROCESSING]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_BATCH_SUCCESS]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_BLOCKED]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_CANCELED]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_DENIED]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_FAILED]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_HELD]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_REFUNDED]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_RETURNED]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_SUCCEEDED]: ignoreWebhookEvent,
+  [WatchedPaypalWebhookEvent.PAYOUTS_ITEM_UNCLAIMED]: ignoreWebhookEvent,
+  // Captures
+  [WatchedPaypalWebhookEvent.CAPTURE_COMPLETED]: handleCaptureCompleted,
+  [WatchedPaypalWebhookEvent.CAPTURE_REFUNDED]: handleCaptureRefunded,
+  [WatchedPaypalWebhookEvent.CAPTURE_REVERSED]: handleCaptureRefunded,
+  // Subscriptions
+  [WatchedPaypalWebhookEvent.SUBSCRIPTION_CANCELLED]: handleSubscriptionCancelled,
+  [WatchedPaypalWebhookEvent.SUBSCRIPTION_SUSPENDED]: handleSubscriptionSuspended,
+  [WatchedPaypalWebhookEvent.SUBSCRIPTION_ACTIVATED]: handleSubscriptionActivated,
+  // Sales
+  [WatchedPaypalWebhookEvent.SALE_COMPLETED]: handleSaleCompleted,
+  [WatchedPaypalWebhookEvent.SALE_REFUNDED]: handleSaleRefunded,
+  [WatchedPaypalWebhookEvent.SALE_REVERSED]: handleSaleReversed,
+};
+
+const getEventHandler = (eventType: string | WatchedPaypalWebhookEvent): ((req: Request) => Promise<void>) => {
+  return eventType in EventHandlers ? EventHandlers[eventType as WatchedPaypalWebhookEvent] : ignoreWebhookEvent;
+};
+
+/**
+ * Webhook entrypoint. When adding a new event type here, you should also add it to
+ * `server/lib/paypal.ts` > `WATCHED_EVENT_TYPES` and run `scripts/paypal/webhooks.ts`
+ * to update all existing webhooks.
+ */
+async function webhook(req: Request): Promise<void> {
+  debug('new event', req.body);
+  assert(req.params?.hostId, 'hostId is required');
+
+  try {
+    const eventType = get(req, 'body.event_type') as string | WatchedPaypalWebhookEvent;
+    const handler = getEventHandler(eventType);
+    await handler(req);
+  } catch (e) {
+    reportErrorToSentry(e, {
+      req,
+      feature: FEATURE.PAYPAL_DONATIONS,
+      extra: { body: req.body },
+      severity: 'error',
+      tags: { paypalWebhook: 'true' },
+    });
+
+    throw e;
+  }
+}
+
+export default webhook;

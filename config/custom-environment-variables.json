@@ -1,0 +1,295 @@
+{
+  "port": "PORT",
+  "env": "OC_ENV",
+  "services": {
+    "server": "ENABLE_SERVICE_SERVER",
+    "searchSync": "ENABLE_SERVICE_SEARCH_SYNC",
+    "exports": "ENABLE_SERVICE_EXPORTS"
+  },
+  "mailpit": {
+    "client": "MAILPIT_CLIENT",
+    "smtpPort": "MAILPIT_SMTP_PORT",
+    "host": "MAILPIT_HOST"
+  },
+  "opensearch": {
+    "url": "OPENSEARCH_URL",
+    "maxSyncDelay": "OPENSEARCH_MAX_SYNC_DELAY",
+    "indexesPrefix": "OPENSEARCH_INDEXES_PREFIX"
+  },
+  "exports": {
+    "concurrency": "EXPORTS_CONCURRENCY"
+  },
+  "database": {
+    "url": "PG_URL",
+    "logQueryOrigin": "PG_LOG_QUERY_ORIGIN",
+    "override": {
+      "database": "PG_DATABASE",
+      "username": "PG_USERNAME",
+      "password": "PG_PASSWORD",
+      "host": "PG_HOST",
+      "port": "PG_PORT"
+    },
+    "options": {
+      "pool": {
+        "min": "PG_MIN_CONNECTIONS",
+        "max": "PG_MAX_CONNECTIONS"
+      },
+      "dialectOptions": {
+        "application_name": "PG_APPLICATION_NAME"
+      }
+    },
+    "readOnly": "DATABASE_READ_ONLY"
+  },
+  "graphql": {
+    "apollo": {
+      "key": "APOLLO_KEY",
+      "graphRef": "APOLLO_GRAPH_REF"
+    },
+    "cache": {
+      "enabled": "GRAPHQL_CACHE_ENABLED",
+      "ttl": "GRAPHQL_CACHE_TTL",
+      "minExecutionTimeToCache": "GRAPHQL_CACHE_MIN_EXECUTION_TIME_TO_CACHE"
+    },
+    "error": {
+      "detailed": "GRAPHQL_ERROR_DETAILED"
+    },
+    "resolverTimeDebugWarning": "GRAPHQL_RESOLVER_TIME_DEBUG",
+    "rejectOnMaxComplexity": "GRAPHQL_REJECT_ON_MAX_COMPLEXITY"
+  },
+  "memcache": {
+    "servers": "MEMCACHE_SERVERS",
+    "username": "MEMCACHE_USERNAME",
+    "password": "MEMCACHE_PASSWORD"
+  },
+  "redis": {
+    "serverUrl": "REDIS_URL",
+    "serverUrlTimeline": "REDIS_TIMELINE_URL",
+    "serverUrlSession": "REDIS_SESSION_URL"
+  },
+  "keys": {
+    "opencollective": {
+      "apiKey": "API_KEY",
+      "sessionSecret": "SESSION_SECRET",
+      "jwtSecret": "JWT_SECRET",
+      "emailUnsubscribeSecret": "EMAIL_UNSUBSCRIBE_SECRET",
+      "hashidSalt": "HASHID_SALT",
+      "pdfApiKey": "PDF_SERVICE_API_KEY"
+    }
+  },
+  "log": {
+    "level": "LOG_LEVEL",
+    "accessLogs": "ACCESS_LOGS",
+    "slowRequest": "SLOW_REQUEST",
+    "slowRequestThreshold": "SLOW_REQUEST_THRESHOLD",
+    "slowMiddleware": "LOG_SLOW_MIDDLEWARE",
+    "slowMiddlewareThreshold": "LOG_SLOW_MIDDLEWARE_THRESHOLD"
+  },
+  "platform": {
+    "collectiveId": "OC_PLATFORM_COLLECTIVE_ID",
+    "userId": "OC_PLATFORM_USER_ID",
+    "currency": "OC_PLATFORM_CURRENCY",
+    "address": "OC_PLATFORM_ADDRESS",
+    "country": "OC_PLATFORM_COUNTRY",
+    "name": "OC_PLATFORM_NAME"
+  },
+  "gocardless": {
+    "secretId": "GOCARDLESS_SECRET_ID",
+    "secretKey": "GOCARDLESS_SECRET_KEY"
+  },
+  "plaid": {
+    "clientId": "PLAID_CLIENT_ID",
+    "secret": "PLAID_SECRET",
+    "env": "PLAID_ENV"
+  },
+  "stripe": {
+    "secret": "STRIPE_SECRET",
+    "key": "STRIPE_KEY",
+    "clientId": "STRIPE_CLIENT_ID",
+    "webhookSigningSecret": "STRIPE_WEBHOOK_SIGNING_SECRET",
+    "paymentIntentEnabled": "STRIPE_PAYMENT_INTENT_ENABLED",
+    "oneTimePaymentMethodConfiguration": "STRIPE_ONETIME_PAYMENT_METHOD_CONFIGURATION",
+    "recurringPaymentMethodConfiguration": "STRIPE_RECURRING_PAYMENT_METHOD_CONFIGURATION"
+  },
+  "aws": {
+    "s3": {
+      "key": "AWS_KEY",
+      "secret": "AWS_SECRET",
+      "bucket": "AWS_S3_BUCKET",
+      "region": "AWS_S3_REGION",
+      "apiVersion": "AWS_S3_API_VERSION",
+      "endpoint": "AWS_S3_ENDPOINT",
+      "sslEnabled": "AWS_S3_SSL_ENABLED",
+      "forcePathStyle": "AWS_S3_FORCE_PATH_STYLE"
+    }
+  },
+  "cloudflare": {
+    "key": "CLOUDFLARE_KEY",
+    "email": "CLOUDFLARE_EMAIL",
+    "zone": "CLOUDFLARE_ZONE"
+  },
+  "klippa": {
+    "apiKey": "KLIPPA_API_KEY",
+    "enabled": "KLIPPA_ENABLED"
+  },
+  "paypal": {
+    "payment": {
+      "environment": "PAYPAL_ENVIRONMENT"
+    },
+    "connect": {
+      "clientId": "PAYPAL_CLIENT_ID",
+      "clientSecret": "PAYPAL_CLIENT_SECRET",
+      "redirectUri": "PAYPAL_CONNECT_REDIRECT_URI"
+    }
+  },
+  "mailgun": {
+    "user": "MAILGUN_USER",
+    "password": "MAILGUN_PASSWORD",
+    "apiKey": "MAILGUN_API_KEY"
+  },
+  "host": {
+    "api": "API_URL",
+    "images": "IMAGES_URL",
+    "frontend": "FRONTEND_URL",
+    "website": "WEBSITE_URL",
+    "pdf": "PDF_SERVICE_URL",
+    "rest": "REST_URL",
+    "ml": "ML_SERVICE_URL",
+    "webhooks": "WEBHOOKS_URL"
+  },
+  "limits": {
+    "ordersPerHour": {
+      "perAccount": "ORDERS_LIMIT_ACCOUNT",
+      "perAccountForCollective": "ORDERS_LIMIT_ACCOUNT_COLLECTIVE",
+      "perEmail": "ORDERS_LIMIT_EMAIL",
+      "perEmailForCollective": "ORDERS_LIMIT_EMAIL_COLLECTIVE",
+      "perIp": "ORDERS_LIMIT_IP",
+      "perMask": "ORDERS_LIMIT_MASK",
+      "forCollective": "ORDERS_LIMIT_COLLECTIVE"
+    },
+    "skipCleanOrdersLimitSlugs": "ORDERS_LIMIT_SKIP_CLEAN_SLUGS",
+    "enabledMasks": "ORDERS_LIMIT_ENABLED_MASKS",
+    "userSignUpPerHour": "LIMIT_USER_SIGNUP_PER_HOUR",
+    "search": {
+      "concurrentRequests": "LIMIT_SEARCH_CONCURRENT_REQUESTS"
+    }
+  },
+  "slack": {
+    "webhooks": {
+      "abuse": "SLACK_WEBHOOK_ABUSE",
+      "engineeringAlerts": "SLACK_WEBHOOK_ENGINEERING_ALERTS"
+    }
+  },
+  "github": {
+    "clientID": "GITHUB_CLIENT_ID",
+    "clientSecret": "GITHUB_CLIENT_SECRET"
+  },
+  "fixer": {
+    "accessKey": "FIXER_ACCESS_KEY",
+    "disableMock": "FIXER_DISABLE_MOCK"
+  },
+  "captcha": {
+    "enabled": "CAPTCHA_ENABLE"
+  },
+  "recaptcha": {
+    "siteKey": "RECAPTCHA_SITE_KEY",
+    "secretKey": "RECAPTCHA_SECRET_KEY"
+  },
+  "hcaptcha": {
+    "secret": "HCAPTCHA_SECRET",
+    "sitekey": "HCAPTCHA_SITEKEY"
+  },
+  "turnstile": {
+    "secretKey": "TURNSTILE_SECRET"
+  },
+  "taxForms": {
+    "encryptionKey": "TAX_FORMS_ENCRYPTION_KEY",
+    "aws": {
+      "s3": {
+        "bucket": "TAX_FORMS_AWS_S3_BUCKET"
+      }
+    }
+  },
+  "githubFlow": {
+    "minNbStars": "GITHUB_FLOW_MIN_NB_STARS"
+  },
+  "transferwise": {
+    "apiUrl": "TRANSFERWISE_API_URL",
+    "oauthUrl": "TRANSFERWISE_OAUTH_URL",
+    "clientKey": "TRANSFERWISE_CLIENT_KEY",
+    "clientId": "TRANSFERWISE_CLIENT_ID",
+    "clientSecret": "TRANSFERWISE_CLIENT_SECRET",
+    "redirectUri": "TRANSFERWISE_REDIRECT_URI",
+    "privateKey": "TRANSFERWISE_PRIVATE_KEY",
+    "blockedCountries": "TRANSFERWISE_BLOCKED_COUNTRIES",
+    "blockedCurrencies": "TRANSFERWISE_BLOCKED_CURRENCIES",
+    "blockedCurrenciesForBusinessProfiles": "TRANSFERWISE_BLOCKED_CURRENCIES_BUSINESS",
+    "recipientTypesBlockedForBusinessProfiles": "TRANSFERWISE_BLOCKED_RECIPIENT_TYPES_BUSINESS",
+    "blockedCurrenciesForNonProfits": "TRANSFERWISE_BLOCKED_CURRENCIES_NONPROFIT",
+    "useTransferRefundHandler": "TRANSFERWISE_USE_TRANSFER_REFUND_HANDLER",
+    "useSimplifiedQuote": "TRANSFERWISE_USE_SIMPLIFIED_QUOTE"
+  },
+  "hyperwatch": {
+    "enabled": "HYPERWATCH_ENABLED",
+    "path": "HYPERWATCH_PATH",
+    "realm": "HYPERWATCH_REALM",
+    "username": "HYPERWATCH_USERNAME",
+    "secret": "HYPERWATCH_SECRET"
+  },
+  "dbEncryption": {
+    "secretKey": "DB_ENCRYPTION_SECRET_KEY",
+    "cipher": "DB_ENCRYPTION_CIPHER"
+  },
+  "pdfService": {
+    "fetchTransactionsReceipts": "FETCH_TRANSACTIONS_RECEIPTS"
+  },
+  "restService": {
+    "fetchCollectiveTransactionsCsv": "FETCH_COLLECTIVE_TRANSACTIONS_CSV",
+    "fetchHostTransactionsCsv": "FETCH_HOST_TRANSACTIONS_CSV"
+  },
+  "sentry": {
+    "dsn": "SENTRY_DSN",
+    "tracesSampleRate": "SENTRY_TRACES_SAMPLE_RATE",
+    "profilesSampleRate": "SENTRY_PROFILES_SAMPLE_RATE",
+    "minExecutionTimeToSample": "SENTRY_MIN_EXECUTION_TIME_TO_SAMPLE"
+  },
+  "ledger": {
+    "fastBalance": "LEDGER_FAST_BALANCE",
+    "separatePaymentProcessorFees": "LEDGER_SEPARATE_PAYMENT_PROCESSOR_FEES",
+    "separateTaxes": "LEDGER_SEPARATE_TAXES",
+    "orderedTransactions": "LEDGER_ORDERED_TRANSACTIONS"
+  },
+  "timeline": {
+    "daysCached": "TIMELINE_DAYS_CACHED",
+    "disabled": "TIMELINE_DISABLED"
+  },
+  "activities": {
+    "skipTransactions": "SKIP_TRANSACTION_ACTIVITIES",
+    "legacyTransactionsCollectiveIds": "LEGACY_TRANSACTIONS_ACTIVITY_COLLECTIVE_IDS"
+  },
+  "twoFactorAuthentication": {
+    "enabled": "TWO_FACTOR_AUTHENTICATION_ENABLED"
+  },
+  "fraud": {
+    "order": {
+      "user": "FRAUD_ORDER_USER",
+      "card": "FRAUD_ORDER_CARD",
+      "email": "FRAUD_ORDER_EMAIL",
+      "ip": "FRAUD_ORDER_IP"
+    },
+    "enforceSuspendedAsset": "FRAUD_PROTECTION_SUSPEND_ASSET"
+  },
+  "gitbook": {
+    "apiKey": "GITBOOK_API_KEY",
+    "apiUrl": "GITBOOK_API_URL",
+    "spaceId": "GITBOOK_SPACE_ID"
+  },
+  "opentelemetry": {
+    "enabled": "OPENTELEMETRY_ENABLED"
+  },
+  "features": {
+    "newPricing": "NEW_PRICING"
+  },
+  "settlement": {
+    "minimumAmountInUSD": "SETTLEMENT_MINIMUM_AMOUNT_IN_USD"
+  }
+}

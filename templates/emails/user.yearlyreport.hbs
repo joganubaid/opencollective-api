@@ -1,0 +1,130 @@
+Subject: 🏅Your year on Open Collective
+
+{{> header}}
+
+<style>
+  .host {
+    margin: 20px 0px;
+  }
+
+  th {
+    padding: 10px;
+    font-weight: normal;
+    font-size: 14px;
+    vertical-align: top;
+  }
+
+  th a {
+    color: #7A7B82;
+    text-decoration: none;
+  }
+
+  .host .CollectiveCard {
+    margin: 0px 6px 16px 2px;
+  }
+
+  .stats {
+    border-radius: 30px;
+    max-width: 300px;
+    margin: 10px auto;
+    box-shadow: 0 1px 3px 0 rgba(45, 77, 97, 0.1);
+    border: 1px solid rgba(45, 77, 97, 0.1);
+    padding: 10px;
+    text-align: center;
+  }
+
+  .stats .btn {
+    width: 100%;
+    background: #80d823;
+    border: 1px solid transparent;
+    border-radius: 28px;
+    display: inline-block;
+    padding: .75rem 1rem;
+    text-transform: uppercase;
+    text-align: center;
+    font-weight: 700;
+    min-width: 150px;
+    box-sizing: border-box;
+    vertical-align: middle;
+    color: #fff;
+    text-decoration: none;
+    margin-bottom: 5px;
+  }
+
+  .btn {
+    height: auto;
+  }
+
+  .largeEmoji {
+    margin: 15px;
+    font-size: 64px;
+  }
+</style>
+
+
+<p>
+  Hi {{collective.name}}!
+</p>
+
+<p>
+  {{year}} is ending.
+</p>
+
+<p>
+  We believe more than ever in the strength of communities. Our communities make our contributions matter. They give us an opportunity to connect and to learn. They give us the opportunity to make a difference.
+</p>
+
+<p>
+  We need to nurture communities. They need us to contribute with our time, skills, and money. If we all contribute, we will be
+  surrounded by thriving communities. 🌍
+</p>
+<p>
+  In {{year}}, {{platformStats.totalCollectives}} Collectives joined our community of Open Collective. Together, they raised {{currency platformStats.totalAnnualBudget currency="USD"}} this year 💰💰💰.
+</p>
+
+<p>
+  Thank you for your contributions this year. Thank you for playing your part in building this future 🙏.
+</p>
+
+<p>In {{year}} you have contributed a total of {{stats.totalDonationsString}} across {{stats.totalCollectives}}
+  {{pluralize "collective" n=stats.totalCollectives}}:
+</p>
+
+<div>
+  {{#each hosts}}
+  {{#if name}}
+  <div class="host">
+    <table width="100%" height=30>
+      <tr>
+        <td class="tdline"></td>
+        <th rowspan=2 nowrap><a href="{{@root.config.host.website}}/{{slug}}">{{name}}</a></th>
+        <td class="tdline"></td>
+      </tr>
+      <tr>
+        <td>&nbsp;</td>
+        <td>&nbsp;</td>
+      </tr>
+    </table>
+    {{/if}}
+    <center>
+      {{#each collectives}}
+      {{> collectivecard}}
+      {{/each}}
+    </center>
+  </div>
+  {{/each}}
+</div>
+
+<p>
+  <b>📍Tips:</b><br />
+  - <a href="https://opencollective.com/discover">Discover other great Collectives</a> to support<br />
+  - <a href="https://opencollective.com/recurring-contributions">Manage your recurring contributions</a><br />
+  - We are open too! <a href="https://github.com/opencollective/opencollective">our code is
+    open source</a> and <a href="https://opencollective.com/opencollective">our budget is transparent</a>! 😊
+</p>
+
+<p>
+  - Team Open Collective
+</p>
+
+{{>footer}}

@@ -1,0 +1,28 @@
+import { get } from 'lodash';
+
+import POLICIES, { DEFAULT_POLICIES, Policies } from '../constants/policies';
+import { Collective, User } from '../models';
+
+export const getPolicy = async <T extends POLICIES>(
+  collective: Collective,
+  policy: T,
+  { loaders = undefined, transaction = undefined } = {},
+): Promise<Policies[T]> => {
+  let account = collective;
+  if (collective?.ParentCollectiveId) {
+    account = await collective.getParentCollective({ transaction, loaders });
+  }
+  return get(account, ['data', 'policies', policy], DEFAULT_POLICIES[policy]);
+};
+
+export const POLICIES_EDITABLE_BY_HOST_ONLY = [POLICIES.COLLECTIVE_ADMINS_CAN_SEE_PAYOUT_METHODS];
+
+export const canEditPolicy = (user: User, collective: Collective, policy: POLICIES): boolean => {
+  if (!user) {
+    return false;
+  } else if (POLICIES_EDITABLE_BY_HOST_ONLY.includes(policy)) {
+    return user.isAdmin(collective.HostCollectiveId);
+  } else {
+    return user.isAdminOfCollective(collective);
+  }
+};

@@ -1,0 +1,2107 @@
+import assert from 'assert';
+
+import config from 'config';
+import debugLib from 'debug';
+import { compact, get, head, isNil, isNull, isUndefined, omit, pick } from 'lodash';
+import moment from 'moment';
+import {
+  BelongsToGetAssociationMixin,
+  CreationOptional,
+  InferAttributes,
+  InferCreationAttributes,
+  Transaction as SequelizeTransaction,
+} from 'sequelize';
+import Stripe from 'stripe';
+import { v4 as uuid } from 'uuid';
+
+import activities from '../constants/activities';
+import { SupportedCurrency } from '../constants/currencies';
+import { PAYMENT_METHOD_SERVICE } from '../constants/paymentMethods';
+import PlatformConstants from '../constants/platform';
+import { RefundKind } from '../constants/refund-kind';
+import { TransactionKind } from '../constants/transaction-kind';
+import { TransactionTypes } from '../constants/transactions';
+import { shouldGenerateTransactionActivities } from '../lib/activities';
+import { getFxRate, roundCentsAmount } from '../lib/currency';
+import logger from '../lib/logger';
+import { toNegative } from '../lib/math';
+import { syncPaymentIntentFromLedgerTransaction } from '../lib/payment-intents/sync';
+import { calcFee, getHostFeeSharePercent } from '../lib/payments';
+import { EntityShortIdPrefix } from '../lib/permalink/entity-map';
+import { stripHTML } from '../lib/sanitize-html';
+import { reportErrorToSentry, reportMessageToSentry } from '../lib/sentry';
+import sequelize, { DataTypes, Op } from '../lib/sequelize';
+import { getPaymentProcessorFeeVendor, getTaxVendor } from '../lib/transactions';
+import { exportToCSV, parseToBoolean } from '../lib/utils';
+import type { PaypalCapture, PaypalSale, PaypalTransaction } from '../types/paypal';
+import type { Transfer } from '../types/transferwise';
+
+import Activity from './Activity';
+import Collective from './Collective';
+import CustomDataTypes from './DataTypes';
+import type Expense from './Expense';
+import type { ExpenseTaxDefinition } from './Expense';
+import { ModelWithPublicId } from './ModelWithPublicId';
+import Order, { OrderTax } from './Order';
+import type PaymentIntent from './PaymentIntent';
+import PaymentMethod from './PaymentMethod';
+import PayoutMethod, { PayoutMethodTypes } from './PayoutMethod';
+import TransactionSettlement, { TransactionSettlementStatus } from './TransactionSettlement';
+import User from './User';
+
+const { CREDIT, DEBIT } = TransactionTypes;
+
+const { CONTRIBUTION, EXPENSE, ADDED_FUNDS } = TransactionKind;
+
+export const MERCHANT_ID_PATHS = {
+  [CONTRIBUTION]: [
+    'data.charge.id', // stripeId
+    'data.capture.id', // onetimePaypalPaymentId
+    'data.paypalSale.id', // recurringPaypalPaymentId
+    'data.paypalResponse.id', // paypalResponseId
+  ],
+  [EXPENSE]: [
+    'data.transfer.id', // wiseId
+    'data.transaction_id', // paypalPayoutId
+    'data.token', // privacyId
+    'data.transaction.id', // stripeVirtualCardId
+  ],
+} as const;
+
+const debug = debugLib('models:Transaction');
+
+type Tax = OrderTax | ExpenseTaxDefinition;
+
+export type TransactionData = {
+  balanceTransaction?: Stripe.BalanceTransaction;
+  capture?: Partial<PaypalCapture>;
+  charge?: Stripe.Charge;
+  dispute?: Stripe.Dispute;
+  expenseToHostFxRate?: number;
+  feesPayer?: Expense['feesPayer'];
+  fxRates?: {
+    expenseToHost?: number;
+    collectiveToHost?: number;
+    expenseToCollective?: number;
+    expenseToPayoutMethod?: number;
+  };
+  hasPlatformTip?: boolean;
+  isSharedRevenue?: boolean;
+  isBalanceTransfer?: boolean;
+  isRootBalanceTransfer?: boolean;
+  hostFeeMigration?: string;
+  hostFeeSharePercent?: number;
+  hostToPlatformFxRate?: number;
+  isManual?: boolean;
+  isPlatformRevenueDirectlyCollected?: boolean;
+  isRefundedFromOurSystem?: boolean;
+  isRefundedFromPayPal?: boolean;
+  oppositeTransactionFeesCurrencyFxRate?: number;
+  oppositeTransactionHostCurrencyFxRate?: number;
+  paymentProcessorFeeMigration?: string;
+  paypalCaptureId?: string;
+  paypalResponse?: Record<string, unknown>;
+  paypalSale?: Partial<PaypalSale>;
+  paypalTransaction?: Partial<PaypalTransaction>;
+  platformTip?: number;
+  platformTipEligible?: boolean;
+  platformTipInHostCurrency?: number;
+  preMigrationData?: Record<string, unknown>;
+  migration?: unknown;
+  refund?: Stripe.Refund;
+  refundedFromDoubleTransactionsScript?: boolean;
+  refundReason?: string;
+  refundTransactionId?: Transaction['id'];
+  review?: Stripe.Event; // Why not Stripe.Review? Who knows
+  tax?: Tax;
+  taxAmountRemovedFromMigration?: number;
+  taxMigration?: string;
+  taxRemovedFromMigration?: Tax;
+  transfer?: Transfer;
+  transaction?: Record<string, unknown>; // This field is used by `persistVirtualCardTransaction` to store the provider's transaction data
+  id?: string; // Up to 2021-06-08, this field was used to store the external IDs of virtual card transactions
+  token?: string; // Up to 2021-11-19, this field was used to store the external IDs of privacy.com transactions
+  refundWiseEventTimestamp?: string; // This field is used to guarantee that the Wise refund event is processed only once
+  createPaymentResponse?: {
+    defaultFundingPlan: {
+      fundingAmount: {
+        amount: string;
+      };
+    };
+  };
+  /** Set by scripts/stripe/fix-invalid-amounts when a row is corrected. Can be removed once the fix has been confirmed. */
+  fixedByStripeInvalidOrderAmountScript?: {
+    date: string;
+    previousValues: Record<string, unknown>;
+  };
+};
+
+class Transaction extends ModelWithPublicId<
+  EntityShortIdPrefix.Transaction,
+  InferAttributes<Transaction>,
+  InferCreationAttributes<Transaction>
+> {
+  public static readonly nanoIdPrefix = EntityShortIdPrefix.Transaction;
+  public static readonly tableName = 'Transactions' as const;
+
+  declare id: CreationOptional<number>;
+  declare type: TransactionTypes | `${TransactionTypes}`;
+  declare kind: TransactionKind;
+  declare uuid: CreationOptional<string>;
+  declare description: string;
+  declare amount: number;
+  declare currency: SupportedCurrency;
+  declare hostCurrency: SupportedCurrency;
+  declare hostCurrencyFxRate: number;
+  declare netAmountInCollectiveCurrency: number;
+  declare amountInHostCurrency: number;
+  /** @deprecated host fees are now recorded as separate transactions */
+  declare hostFeeInHostCurrency: number | null;
+  /** @deprecated payment processor fees are now recorded as separate transactions */
+  declare paymentProcessorFeeInHostCurrency: number | null;
+  /** @deprecated platform fees are now recorded as separate transactions */
+  declare platformFeeInHostCurrency: number | null;
+  declare taxAmount: number | null;
+  declare data: TransactionData | null;
+  declare TransactionGroup: string;
+  declare isRefund: boolean;
+  declare isDebt: boolean;
+  declare isDisputed: boolean;
+  declare isInReview: boolean;
+  declare isInternal: boolean;
+  declare refundKind: RefundKind | null;
+
+  // Timestamps
+  declare createdAt: Date;
+  declare updatedAt: Date;
+  declare deletedAt: Date;
+  /** The effective date the transaction was settled outside the platform, in the account it transacted. */
+  declare clearedAt: Date;
+
+  // Foreign keys
+  declare CreatedByUserId: number;
+  declare FromCollectiveId: number;
+  declare CollectiveId: number;
+  declare HostCollectiveId: number;
+  declare UsingGiftCardFromCollectiveId: number;
+  declare OrderId: number;
+  declare ExpenseId: number;
+  declare PayoutMethodId: number;
+  declare PaymentMethodId: number;
+  declare RefundTransactionId: number;
+  declare PaymentIntentId: number;
+
+  // Associations
+  declare createdByUser?: User;
+  declare fromCollective?: Collective;
+  declare host?: Collective;
+  declare usingGiftCardFromCollective?: Collective;
+  declare collective?: Collective;
+  declare PaymentMethod?: PaymentMethod;
+  declare PayoutMethod?: PayoutMethod;
+  declare Order?: Order;
+  declare PaymentIntent?: PaymentIntent;
+
+  // Getter Methods
+  declare info?: Partial<Transaction>;
+  declare merchantId?: string;
+  declare netAmountInHostCurrency?: number;
+  declare amountSentToHostInHostCurrency?: number;
+
+  // Virtual field
+  declare settlementStatus: TransactionSettlementStatus;
+
+  // Class methods
+  declare getHostCollective: (options?: { loaders?: any }) => Promise<Collective>;
+  declare getCollective: BelongsToGetAssociationMixin<Collective>;
+  declare getOrder: BelongsToGetAssociationMixin<Order>;
+  declare getExpense: BelongsToGetAssociationMixin<Expense>;
+  declare hasPlatformTip: () => boolean;
+  declare getRelatedTransaction: (
+    options: {
+      type?: string | string[];
+      kind?: string | string[];
+      isDebt?: boolean;
+    },
+    params?: {
+      sqlTransaction?: SequelizeTransaction;
+    },
+  ) => Promise<Transaction>;
+
+  declare getRelatedTransactions: (
+    options?: {
+      type?: string;
+      kind?: string;
+      isDebt?: boolean;
+    },
+    params?: {
+      sqlTransaction?: SequelizeTransaction;
+    },
+  ) => Promise<Transaction[]>;
+
+  declare getOppositeTransaction: (
+    options?: null,
+    params?: { sqlTransaction?: SequelizeTransaction },
+  ) => Promise<Transaction | null>;
+
+  declare getPaymentProcessorFeeTransaction: (
+    options?: null,
+    params?: { sqlTransaction?: SequelizeTransaction },
+  ) => Promise<Transaction | null>;
+
+  declare getTaxTransaction: (
+    options?: null,
+    params?: { sqlTransaction?: SequelizeTransaction },
+  ) => Promise<Transaction | null>;
+
+  declare getPlatformTipTransaction: (
+    options?: Pick<Transaction, 'type'>,
+    params?: { sqlTransaction?: SequelizeTransaction },
+  ) => Promise<Transaction | null>;
+
+  declare getPlatformTipDebtTransaction: (
+    options?: null,
+    params?: { sqlTransaction?: SequelizeTransaction },
+  ) => Promise<Transaction | null>;
+
+  declare getHostFeeTransaction: (
+    options?: Pick<Transaction, 'type'>,
+    params?: { sqlTransaction?: SequelizeTransaction },
+  ) => Promise<Transaction | null>;
+
+  declare getHostFeeShareTransaction: (
+    options?: null,
+    params?: { sqlTransaction?: SequelizeTransaction },
+  ) => Promise<Transaction | null>;
+
+  declare getHostFeeShareDebtTransaction: (
+    options?: null,
+    params?: { sqlTransaction?: SequelizeTransaction },
+  ) => Promise<Transaction | null>;
+
+  declare getRefundTransaction: () => Promise<Transaction | null>;
+
+  declare getGiftCardEmitterCollective: () => Promise<Collective | null>;
+  declare getSource: () => Promise<Collective | null>;
+  declare getUser: () => Promise<User | null>;
+  declare setCurrency: (currency: SupportedCurrency) => Promise<Transaction>;
+  declare paymentMethodProviderCollectiveId: () => number;
+
+  /**
+   * Class Methods
+   */
+  static createMany(transactions: TransactionCreationAttributes[], defaultValues) {
+    return Promise.all(
+      transactions.map(transaction => {
+        for (const attr in defaultValues) {
+          transaction[attr] = defaultValues[attr];
+        }
+        return Transaction.create(transaction) as Promise<Transaction>;
+      }),
+    ).catch(error => {
+      logger.error(error);
+      reportErrorToSentry(error);
+    });
+  }
+
+  static createManyDoubleEntry(transactions: TransactionCreationAttributes[], defaultValues) {
+    return Promise.all(
+      transactions.map(transaction => {
+        for (const attr in defaultValues) {
+          transaction[attr] = defaultValues[attr];
+        }
+        return Transaction.createDoubleEntry(transaction) as Promise<Transaction>;
+      }),
+    ).catch(error => {
+      logger.error(error);
+      reportErrorToSentry(error);
+    });
+  }
+
+  static exportCSV(transactions, collectivesById) {
+    const getColumnName = attr => {
+      if (attr === 'CollectiveId') {
+        return 'collective';
+      }
+      if (attr === 'Expense.privateMessage') {
+        return 'private note';
+      } else {
+        return attr;
+      }
+    };
+
+    const processValue = (attr, value) => {
+      if (attr === 'CollectiveId') {
+        return get(collectivesById[value], 'slug');
+      } else if (attr === 'createdAt') {
+        return moment(value).format('YYYY-MM-DD');
+      } else if (attr === 'Expense.privateMessage') {
+        return value && stripHTML(value);
+      } else if (
+        [
+          'amount',
+          'netAmountInCollectiveCurrency',
+          'paymentProcessorFeeInHostCurrency',
+          'hostFeeInHostCurrency',
+          'platformFeeInHostCurrency',
+          'netAmountInHostCurrency',
+          'amountInHostCurrency',
+          'taxAmount',
+        ].indexOf(attr) !== -1
+      ) {
+        return value / 100; // converts cents
+      }
+      return value;
+    };
+
+    const attributes = [
+      'id',
+      'createdAt',
+      'type',
+      'CollectiveId',
+      'amount',
+      'amountInHostCurrency',
+      'currency',
+      'description',
+      'netAmountInCollectiveCurrency',
+      'hostCurrency',
+      'hostCurrencyFxRate',
+      'paymentProcessorFeeInHostCurrency',
+      'hostFeeInHostCurrency',
+      'platformFeeInHostCurrency',
+      'netAmountInHostCurrency',
+      'Expense.privateMessage',
+      'source',
+      'isRefund',
+    ];
+
+    // We only add tax amount for relevant hosts (subject to VAT or GST)
+    const mightHaveTaxes = transaction => transaction.taxAmount || ['NZD', 'EUR'].includes(transaction.hostCurrency);
+    if (transactions.some(mightHaveTaxes)) {
+      attributes.splice(5, 0, 'taxAmount');
+    }
+
+    return exportToCSV(transactions, attributes, getColumnName, processValue);
+  }
+
+  /**
+   * Create the opposite transaction from the perspective of the FromCollective
+   * There is no fees
+   * @POST Two transactions are created. Returns the initial transaction FromCollectiveId -> CollectiveId
+   *
+   * Examples (simplified with rounded numbers):
+   * - Expense1 from User1 paid by Collective1
+   *   - amount: $10
+   *   - PayPal Fees: $1
+   *   - Host Fees: $0
+   *   - Platform Fees: $0
+   *   => DEBIT: Collective: C1, FromCollective: U1
+   *      amount: -$10, netAmountInCollectiveCurrency: -$11, paymentProcessorFeeInHostCurrency: -$1, platformFeeInHostCurrency: 0, hostFeeInHostCurrency: 0
+   *   => CREDIT: Collective: U1, FromCollective: C1
+   *      amount: $11, netAmountInCollectiveCurrency: $10, paymentProcessorFeeInHostCurrency: -$1, platformFeeInHostCurrency: 0, hostFeeInHostCurrency: 0
+   *
+   * - Donation1 from User1 to Collective1
+   *   - amount: $10
+   *   - Stripe Fees: $1
+   *   - Host Fees: $1
+   *   - Platform Fees: $1
+   *   => DEBIT: Collective: U1, FromCollective: C1
+   *      amount: -$7, netAmountInCollectiveCurrency: -$10, paymentProcessorFeeInHostCurrency: -$1, platformFeeInHostCurrency: -$1, hostFeeInHostCurrency: -$1
+   *   => CREDIT: Collective: C1, FromCollective: U1
+   *      amount: $10, netAmountInCollectiveCurrency: $7, paymentProcessorFeeInHostCurrency: -$1, platformFeeInHostCurrency: -$1, hostFeeInHostCurrency: -$1
+   *
+   * Note:
+   * We should simplify a Transaction to:
+   * CollectiveId, DEBIT/CREDIT, amount, currency, OrderId where amount is always the net amount in the currency of CollectiveId
+   * and we should move paymentProcessorFee, platformFee, hostFee to the Order model
+   *
+   */
+  static async createDoubleEntry(
+    transaction: TransactionCreationAttributes,
+    { sequelizeTransaction }: { sequelizeTransaction?: SequelizeTransaction } = {},
+  ): Promise<Transaction> {
+    const runInTransaction = async sequelizeTransaction => {
+      const finalizeLedgerWrite = async (writtenTransaction: Transaction): Promise<Transaction> => {
+        await syncPaymentIntentFromLedgerTransaction(writtenTransaction, sequelizeTransaction);
+        return writtenTransaction;
+      };
+
+      // Force transaction type based on amount sign
+      if (transaction.amount > 0) {
+        transaction.type = CREDIT;
+      } else if (transaction.amount < 0) {
+        transaction.type = DEBIT;
+      } else if (!transaction.type) {
+        throw new Error('Transaction type must be set when amount is 0');
+      }
+
+      if (!transaction.PaymentMethod && transaction.PaymentMethodId) {
+        transaction.PaymentMethod = await PaymentMethod.findByPk(transaction.PaymentMethodId, {
+          transaction: sequelizeTransaction,
+        });
+      }
+
+      if (
+        transaction.kind === EXPENSE &&
+        transaction.type === CREDIT &&
+        !transaction.isRefund &&
+        // Expenses paid with stripe are accounted by the receiving end, so it's allowed to be initiated here as
+        // a credit to the host receiving the expense payment.
+        transaction.PaymentMethod?.service !== PAYMENT_METHOD_SERVICE.STRIPE
+      ) {
+        throw new Error('Transaction kind=EXPENSE should be initiated as a DEBIT transaction.');
+      } else if (transaction.kind === CONTRIBUTION && transaction.type === DEBIT && !transaction.isRefund) {
+        throw new Error('Transaction kind=CONTRIBUTION should be initiated as a CREDIT transaction.');
+      }
+      // TODO: should we check for refunds also?
+
+      transaction.netAmountInCollectiveCurrency = transaction.netAmountInCollectiveCurrency || transaction.amount;
+      transaction.TransactionGroup = transaction.TransactionGroup || uuid();
+      transaction.hostCurrencyFxRate = transaction.hostCurrencyFxRate || 1;
+
+      // Create Platform Tip transaction
+      if (!transaction.isRefund) {
+        if (transaction.data?.platformTip) {
+          // Separate donation transaction and remove platformTip from the main transaction
+          const result = await Transaction.createPlatformTipTransactions(transaction, { sequelizeTransaction });
+          // Transaction was modified by createPlatformTipTransactions, we get it from the result
+          if (result && result.transaction) {
+            transaction = result.transaction;
+          }
+        }
+
+        // Create Host Fee Transaction
+        if (transaction.hostFeeInHostCurrency) {
+          const result = await Transaction.createHostFeeTransactions(transaction, null, { sequelizeTransaction });
+          if (result) {
+            if (result.hostFeeTransaction) {
+              await Transaction.createHostFeeShareTransactions(
+                {
+                  transaction: result.transaction,
+                  hostFeeTransaction: result.hostFeeTransaction,
+                },
+                { sequelizeTransaction },
+              );
+            }
+            // Transaction was modified by createHostFeeTransaction, we get it from the result
+            if (result.transaction) {
+              transaction = result.transaction;
+            }
+          }
+        }
+      }
+
+      // Create Tax transaction
+      if (transaction.taxAmount && parseToBoolean(config.ledger.separateTaxes) === true) {
+        const result = await Transaction.createTaxTransactions(transaction, null, { sequelizeTransaction });
+        if (result) {
+          // Transaction was modified by createTaxTransactions, we get it from the result
+          transaction = result.transaction;
+        }
+      }
+
+      // Create Payment Processor Fee transaction
+      if (
+        transaction.paymentProcessorFeeInHostCurrency &&
+        parseToBoolean(config.ledger.separatePaymentProcessorFees) === true
+      ) {
+        const result = await Transaction.createPaymentProcessorFeeTransactions(transaction, null, {
+          sequelizeTransaction,
+        });
+        if (result) {
+          // Transaction was modified by paymentProcessorFeeTransactions, we get it from the result
+          transaction = result.transaction;
+        }
+      }
+
+      // If FromCollectiveId = CollectiveId, we only create one transaction (DEBIT or CREDIT)
+      if (transaction.FromCollectiveId === transaction.CollectiveId) {
+        return finalizeLedgerWrite(
+          (await Transaction.create(transaction, { transaction: sequelizeTransaction })) as Transaction,
+        );
+      }
+
+      if (!isUndefined(transaction.amountInHostCurrency)) {
+        // ensure this is always INT
+        transaction.amountInHostCurrency = roundCentsAmount(transaction.amountInHostCurrency, transaction.hostCurrency);
+      }
+
+      const fromCollective = await Collective.findByPk(transaction.FromCollectiveId, {
+        transaction: sequelizeTransaction,
+      });
+      const fromCollectiveHost = await fromCollective.getHostCollective({ transaction: sequelizeTransaction });
+
+      let oppositeTransaction = {
+        ...transaction,
+        type: transaction.type === DEBIT ? CREDIT : DEBIT,
+        FromCollectiveId: transaction.CollectiveId,
+        CollectiveId: transaction.FromCollectiveId,
+      };
+
+      if (!fromCollective.isActive || !fromCollectiveHost) {
+        oppositeTransaction = {
+          ...oppositeTransaction,
+          HostCollectiveId: null,
+          amount: -transaction.netAmountInCollectiveCurrency,
+          netAmountInCollectiveCurrency: -transaction.amount,
+          amountInHostCurrency: roundCentsAmount(
+            -transaction.netAmountInCollectiveCurrency * transaction.hostCurrencyFxRate,
+            transaction.hostCurrency,
+          ),
+
+          hostFeeInHostCurrency: transaction.hostFeeInHostCurrency,
+          platformFeeInHostCurrency: transaction.platformFeeInHostCurrency,
+          paymentProcessorFeeInHostCurrency: transaction.paymentProcessorFeeInHostCurrency,
+        };
+      } else {
+        // Is the target "collective" (account) "Active" (has an host, manage its own budget)
+        const hostCurrency = fromCollectiveHost.currency;
+        const hostCurrencyFxRate = await Transaction.getFxRate(transaction.currency, hostCurrency, transaction);
+        const oppositeTransactionHostCurrencyFxRate = await Transaction.getFxRate(
+          transaction.hostCurrency,
+          hostCurrency,
+          transaction,
+        );
+
+        let HostCollectiveId = fromCollectiveHost.id;
+        // Exception: Contributors that are also hosted collectives
+        // We should not assign HostCollectiveId when contributing with PayPal or Stripe,
+        // since this money does not comes out of their hosted balance.
+        if (
+          transaction.PaymentMethod &&
+          transaction.kind === TransactionKind.CONTRIBUTION &&
+          [PAYMENT_METHOD_SERVICE.STRIPE, PAYMENT_METHOD_SERVICE.PAYPAL].includes(transaction.PaymentMethod.service)
+        ) {
+          HostCollectiveId = null;
+        }
+
+        oppositeTransaction = {
+          ...oppositeTransaction,
+          HostCollectiveId,
+          hostCurrency,
+          hostCurrencyFxRate,
+          amount: -roundCentsAmount(transaction.netAmountInCollectiveCurrency, transaction.currency),
+          netAmountInCollectiveCurrency: -roundCentsAmount(transaction.amount, transaction.currency),
+          amountInHostCurrency: -roundCentsAmount(
+            transaction.netAmountInCollectiveCurrency * hostCurrencyFxRate,
+            transaction.hostCurrency,
+          ),
+          hostFeeInHostCurrency: roundCentsAmount(
+            transaction.hostFeeInHostCurrency * oppositeTransactionHostCurrencyFxRate,
+            transaction.hostCurrency,
+          ),
+          platformFeeInHostCurrency: roundCentsAmount(
+            transaction.platformFeeInHostCurrency * oppositeTransactionHostCurrencyFxRate,
+            transaction.hostCurrency,
+          ),
+          paymentProcessorFeeInHostCurrency: roundCentsAmount(
+            transaction.paymentProcessorFeeInHostCurrency * oppositeTransactionHostCurrencyFxRate,
+            transaction.hostCurrency,
+          ),
+          data: { ...omit(transaction.data, ['hostToPlatformFxRate']), oppositeTransactionHostCurrencyFxRate },
+        };
+
+        // Also keep rate on original transaction
+        transaction.data = {
+          ...transaction.data,
+          oppositeTransactionHostCurrencyFxRate: 1 / oppositeTransactionHostCurrencyFxRate,
+        };
+
+        // Handle Host Fee when paying an Expense between Hosts
+        // TODO: This should not be part of `createDoubleEntry`, maybe `createTransactionsFromPaidExpense`?
+        if (
+          transaction.PaymentMethod?.service !== PAYMENT_METHOD_SERVICE.STRIPE && // stripe case handled at in contribution flow
+          oppositeTransaction.kind === 'EXPENSE' &&
+          !oppositeTransaction.isRefund
+        ) {
+          const collective = await Collective.findByPk(transaction.CollectiveId, { transaction: sequelizeTransaction });
+          const collectiveHost = await collective.getHostCollective({ transaction: sequelizeTransaction });
+          if (collectiveHost.id !== fromCollectiveHost.id) {
+            const hostFeePercent = fromCollective.hasMoneyManagement ? 0 : fromCollective.hostFeePercent;
+            const taxAmountInHostCurrency = roundCentsAmount(
+              (transaction.taxAmount || 0) * hostCurrencyFxRate,
+              transaction.hostCurrency,
+            );
+            oppositeTransaction.hostFeeInHostCurrency = calcFee(
+              oppositeTransaction.amountInHostCurrency +
+                oppositeTransaction.paymentProcessorFeeInHostCurrency +
+                taxAmountInHostCurrency,
+              hostFeePercent,
+              hostCurrency,
+            );
+            if (oppositeTransaction.hostFeeInHostCurrency) {
+              await Transaction.createHostFeeTransactions(oppositeTransaction, null, { sequelizeTransaction });
+            }
+          }
+        }
+      }
+
+      debug('createDoubleEntry', transaction, 'opposite', oppositeTransaction);
+
+      // We first record the negative transaction
+      // and only then we can create the transaction to add money somewhere else
+      if (transaction.type === DEBIT) {
+        const t = await Transaction.create(transaction, { transaction: sequelizeTransaction });
+        await Transaction.create(oppositeTransaction, { transaction: sequelizeTransaction });
+        return finalizeLedgerWrite(t);
+      } else {
+        await Transaction.create(oppositeTransaction, { transaction: sequelizeTransaction });
+        return finalizeLedgerWrite(await Transaction.create(transaction, { transaction: sequelizeTransaction }));
+      }
+    };
+
+    return sequelizeTransaction ? runInTransaction(sequelizeTransaction) : sequelize.transaction(runInTransaction);
+  }
+
+  /**
+   * Record a debt transaction and its associated settlement
+   */
+  static async createPlatformTipDebtTransactions(
+    {
+      platformTipTransaction,
+      transaction,
+    }: {
+      platformTipTransaction: Transaction;
+      transaction: TransactionCreationAttributes;
+    },
+    { sequelizeTransaction }: { sequelizeTransaction?: SequelizeTransaction } = {},
+  ): Promise<Transaction> {
+    if (platformTipTransaction.type === DEBIT) {
+      throw new Error('createPlatformTipDebtTransactions must be given a CREDIT transaction');
+    }
+
+    // This should be the host of the original transaction
+    const host = await Transaction.fetchHost(transaction, { sqlTransaction: sequelizeTransaction });
+
+    // Create debt transaction
+    const platformTipDebtTransactionData = {
+      // Copy base values from the original CREDIT PLATFORM_TIP
+      ...pick(platformTipTransaction.dataValues, [
+        'TransactionGroup',
+        'CollectiveId',
+        'HostCollectiveId',
+        'OrderId',
+        'createdAt',
+        'clearedAt',
+        'currency',
+        'hostCurrency',
+        'hostCurrencyFxRate',
+      ]),
+      type: DEBIT,
+      kind: TransactionKind.PLATFORM_TIP_DEBT,
+      isDebt: true,
+      description: 'Platform Tip collected for the Open Collective platform',
+      FromCollectiveId: host.id,
+      // Opposite amounts
+      amount: -platformTipTransaction.amount,
+      netAmountInCollectiveCurrency: -platformTipTransaction.netAmountInCollectiveCurrency,
+      amountInHostCurrency: -platformTipTransaction.amountInHostCurrency,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+    };
+
+    const platformTipDebtTransaction = await Transaction.createDoubleEntry(platformTipDebtTransactionData, {
+      sequelizeTransaction,
+    });
+
+    // Create settlement
+    const settlementStatus = TransactionSettlementStatus.OWED;
+    await TransactionSettlement.createForTransaction(
+      platformTipDebtTransaction,
+      settlementStatus,
+      sequelizeTransaction,
+    );
+
+    return platformTipDebtTransaction;
+  }
+
+  /**
+   * Creates platform tip transactions from a given transaction.
+   * @param {Transaction} The actual transaction
+   * @param {Collective} The host
+   * @param {boolean} Whether tip has been collected already (no debt needed)
+   */
+  static async createPlatformTipTransactions(
+    transaction: TransactionCreationAttributes,
+    { sequelizeTransaction },
+  ): Promise<void | {
+    transaction: TransactionCreationAttributes;
+    platformTipTransaction: Transaction;
+    platformTipDebtTransaction: Transaction | null;
+  }> {
+    const platformTip = transaction.data?.platformTip;
+    if (!platformTip) {
+      return;
+    }
+
+    // amount of the CREDIT should be in the same currency as the original transaction
+    const currency = transaction.currency;
+    const amount = roundCentsAmount(platformTip, currency);
+
+    // amountInHostCurrency of the CREDIT should be in platform currency
+    const hostCurrency = PlatformConstants.PlatformCurrency;
+    const hostCurrencyFxRate = await Transaction.getFxRate(currency, hostCurrency, transaction);
+    const amountInHostCurrency = roundCentsAmount(amount * hostCurrencyFxRate, hostCurrency);
+
+    // we compute the Fx Rate between the original hostCurrency and the platform currency
+    // it might be used later
+    const hostToPlatformFxRate = await Transaction.getFxRate(
+      transaction.hostCurrency,
+      PlatformConstants.PlatformCurrency,
+      transaction,
+    );
+
+    const platformTipTransactionData = {
+      ...pick(transaction, [
+        'TransactionGroup',
+        'FromCollectiveId',
+        'OrderId',
+        'CreatedByUserId',
+        'PaymentMethodId',
+        'UsingGiftCardFromCollectiveId',
+        'clearedAt',
+      ]),
+      type: CREDIT,
+      kind: TransactionKind.PLATFORM_TIP,
+      description: 'Financial contribution to the Open Collective Platform',
+      CollectiveId: PlatformConstants.PlatformCollectiveId,
+      HostCollectiveId: PlatformConstants.PlatformCollectiveId,
+      // Compute Amounts
+      amount,
+      netAmountInCollectiveCurrency: amount,
+      currency,
+      amountInHostCurrency,
+      hostCurrency,
+      hostCurrencyFxRate,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      // Extra data
+      isDebt: false,
+      data: {
+        hostToPlatformFxRate,
+      },
+    };
+
+    const platformTipTransaction = await Transaction.createDoubleEntry(platformTipTransactionData, {
+      sequelizeTransaction,
+    });
+
+    let platformTipDebtTransaction;
+    if (!transaction.data.isPlatformRevenueDirectlyCollected) {
+      platformTipDebtTransaction = await Transaction.createPlatformTipDebtTransactions(
+        {
+          platformTipTransaction,
+          transaction,
+        },
+        { sequelizeTransaction },
+      );
+    }
+
+    // If we have platformTipInHostCurrency available, we trust it, otherwise we compute it
+    const platformTipInHostCurrency = roundCentsAmount(
+      transaction.data?.platformTipInHostCurrency || amount * transaction.hostCurrencyFxRate,
+      transaction.hostCurrency,
+    );
+
+    // Recalculate amount
+    transaction.amountInHostCurrency = roundCentsAmount(
+      transaction.amountInHostCurrency - platformTipInHostCurrency,
+      transaction.hostCurrency,
+    );
+    transaction.amount = roundCentsAmount(transaction.amount - amount, transaction.currency);
+
+    // Reset the platformFee because we're accounting for this value in a separate set of transactions
+    // This way of passing tips is deprecated but still used in some older tests
+    transaction.platformFeeInHostCurrency = 0;
+    transaction.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+
+    return { transaction, platformTipTransaction, platformTipDebtTransaction };
+  }
+
+  static validateContributionPayload(payload: TransactionCreationAttributes): void {
+    if (!payload.amount || typeof payload.amount !== 'number' || payload.amount < 0) {
+      throw new Error('amount should be set and positive');
+    }
+    if (!payload.currency) {
+      throw new Error('currency should be set');
+    }
+    if (
+      payload.hostCurrency &&
+      (!payload.amountInHostCurrency ||
+        typeof payload.amountInHostCurrency !== 'number' ||
+        payload.amountInHostCurrency < 0)
+    ) {
+      throw new Error('amountInHostCurrency should be set and positive');
+    }
+    if (payload.amountInHostCurrency && !payload.hostCurrency) {
+      throw new Error('hostCurrency should be set');
+    }
+    if (payload.type && payload.type !== 'CREDIT') {
+      throw new Error('type should be null or CREDIT');
+    }
+    if (!isNil(payload.netAmountInCollectiveCurrency)) {
+      throw new Error('netAmountInCollectiveCurrency should not be set');
+    }
+  }
+
+  static async createHostFeeTransactions(
+    transaction: TransactionCreationAttributes,
+    data?: TransactionData,
+    { sequelizeTransaction }: { sequelizeTransaction?: SequelizeTransaction } = {},
+  ): Promise<{ transaction: TransactionCreationAttributes; hostFeeTransaction: Transaction } | void> {
+    if (!transaction.hostFeeInHostCurrency) {
+      return;
+    }
+
+    const host = await Transaction.fetchHost(transaction, { sqlTransaction: sequelizeTransaction });
+
+    // The reference value is currently passed as "hostFeeInHostCurrency"
+    const amountInHostCurrency = Math.abs(transaction.hostFeeInHostCurrency);
+    const hostCurrency = transaction.hostCurrency;
+    const hostCurrencyFxRate = transaction.hostCurrencyFxRate;
+
+    // For the Collective/Fund, we calculate the matching amount using the hostCurrencyFxRate
+    const currency = transaction.currency;
+    const amount = roundCentsAmount(amountInHostCurrency / transaction.hostCurrencyFxRate, currency);
+
+    const hostFeeTransactionData = {
+      type: CREDIT,
+      kind: TransactionKind.HOST_FEE,
+      description: 'Host Fee',
+      TransactionGroup: transaction.TransactionGroup,
+      FromCollectiveId: transaction.CollectiveId,
+      CollectiveId: host.id,
+      HostCollectiveId: host.id,
+      // Compute amounts
+      amount,
+      netAmountInCollectiveCurrency: amount,
+      currency: currency,
+      amountInHostCurrency: amountInHostCurrency,
+      hostCurrency: hostCurrency,
+      hostCurrencyFxRate: hostCurrencyFxRate,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      OrderId: transaction.OrderId,
+      ExpenseId: transaction.ExpenseId,
+      createdAt: transaction.createdAt,
+      clearedAt: transaction.clearedAt || transaction.createdAt,
+      data,
+    };
+
+    const hostFeeTransaction = await Transaction.createDoubleEntry(hostFeeTransactionData, { sequelizeTransaction });
+
+    // Reset the original host fee because we're now accounting for this value in a separate set of transactions
+    transaction.hostFeeInHostCurrency = 0;
+    transaction.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+
+    return { transaction, hostFeeTransaction };
+  }
+
+  static async createPaymentProcessorFeeTransactions(
+    transaction: TransactionCreationAttributes,
+    data: Record<string, unknown> | null = null,
+    { sequelizeTransaction }: { sequelizeTransaction?: SequelizeTransaction } = {},
+  ): Promise<{
+    /** The original transaction, potentially modified if a payment processor fees was set */
+    transaction: TransactionCreationAttributes;
+    /** The payment processor fee transaction */
+    paymentProcessorFeeTransaction: Transaction;
+  } | void> {
+    if (!transaction.paymentProcessorFeeInHostCurrency) {
+      return;
+    }
+
+    const paymentMethod =
+      transaction.PaymentMethodId &&
+      (await PaymentMethod.findByPk(transaction.PaymentMethodId, { transaction: sequelizeTransaction }));
+    const payoutMethod =
+      transaction.PayoutMethodId &&
+      (await PayoutMethod.findByPk(transaction.PayoutMethodId, { transaction: sequelizeTransaction }));
+    let service = paymentMethod?.service || payoutMethod?.type || PayoutMethodTypes.OTHER;
+    if (service === PayoutMethodTypes.BANK_ACCOUNT && !data?.transfer) {
+      service = PayoutMethodTypes.OTHER;
+    }
+
+    // SQL transaction should ideally be passed, but it's tricky because the function is memoized.
+    // Shouldn't be safe still.
+    const vendor = await getPaymentProcessorFeeVendor(service);
+
+    // The reference value is currently passed as "hostFeeInHostCurrency"
+    const amountInHostCurrency = Math.abs(transaction.paymentProcessorFeeInHostCurrency);
+    const hostCurrency = transaction.hostCurrency;
+    const hostCurrencyFxRate = transaction.hostCurrencyFxRate;
+
+    // For the Collective/Fund, we calculate the matching amount using the hostCurrencyFxRate
+    const currency = transaction.currency;
+    const amount = roundCentsAmount(amountInHostCurrency / transaction.hostCurrencyFxRate, currency);
+
+    const paymentProcessorFeeTransactionData = {
+      type: CREDIT,
+      kind: TransactionKind.PAYMENT_PROCESSOR_FEE,
+      description: `${vendor.name} payment processor fee`,
+      TransactionGroup: transaction.TransactionGroup,
+      FromCollectiveId: transaction.CollectiveId,
+      CollectiveId: vendor.id,
+      HostCollectiveId: null,
+      // Compute amounts
+      amount,
+      netAmountInCollectiveCurrency: amount,
+      currency: currency,
+      amountInHostCurrency: amountInHostCurrency,
+      hostCurrency: hostCurrency,
+      hostCurrencyFxRate: hostCurrencyFxRate,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      OrderId: transaction.OrderId,
+      ExpenseId: transaction.ExpenseId,
+      PaymentMethodId: transaction.PaymentMethodId,
+      PayoutMethodId: transaction.PayoutMethodId,
+      createdAt: transaction.createdAt,
+      clearedAt: transaction.clearedAt || transaction.createdAt,
+      data,
+    };
+
+    const paymentProcessorFeeTransaction = await Transaction.createDoubleEntry(paymentProcessorFeeTransactionData, {
+      sequelizeTransaction,
+    });
+
+    // Reset the original processor fee because we're now accounting for this value in a separate set of transactions
+    transaction.paymentProcessorFeeInHostCurrency = 0;
+    transaction.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+
+    return { transaction, paymentProcessorFeeTransaction };
+  }
+
+  /**
+   * For contributions, the contributor pays the full amount then the tax is debited from the collective balance (to the TAX vendor)
+   * For expenses, the collective pays the full amount to the payee, then the payee is debited from the tax amount (to the TAX vendor)
+   */
+  static async createTaxTransactions(
+    transaction: TransactionCreationAttributes,
+    data: Record<string, unknown> | null = null,
+    { sequelizeTransaction }: { sequelizeTransaction?: SequelizeTransaction } = {},
+  ): Promise<{
+    /** The original transaction, potentially modified if a payment processor fees was set */
+    transaction: TransactionCreationAttributes;
+    /** The payment processor fee transaction */
+    taxTransaction: Transaction;
+  } | void> {
+    if (!transaction.taxAmount) {
+      return;
+    } else if (transaction.kind === EXPENSE && transaction.type !== DEBIT) {
+      throw new Error('createTaxTransactions should always be passed a DEBIT when kind=EXPENSE');
+    }
+
+    const tax: Tax | undefined = transaction.data?.tax;
+    const taxId: string | undefined = tax?.id;
+    const vendor = await getTaxVendor(taxId);
+
+    const amount = -transaction.taxAmount;
+    const currency = transaction.currency;
+
+    const hostCurrency = transaction.hostCurrency;
+    const hostCurrencyFxRate = transaction.hostCurrencyFxRate;
+    const amountInHostCurrency = -transaction.taxAmount * hostCurrencyFxRate;
+
+    let FromCollectiveId, CollectiveId;
+    if (!transaction.isRefund) {
+      CollectiveId = vendor.id;
+      if (transaction.kind === EXPENSE) {
+        FromCollectiveId = transaction.FromCollectiveId;
+      } else {
+        FromCollectiveId = transaction.CollectiveId;
+      }
+    } else {
+      // it's not likely to be used like this, as taxes are separated
+      FromCollectiveId = vendor.id;
+      if (transaction.kind === EXPENSE) {
+        CollectiveId = transaction.FromCollectiveId;
+      } else {
+        CollectiveId = transaction.CollectiveId;
+      }
+    }
+
+    const taxTransactionData = {
+      type: CREDIT,
+      kind: TransactionKind.TAX,
+      description: `${vendor.name} tax`,
+      TransactionGroup: transaction.TransactionGroup,
+      FromCollectiveId,
+      CollectiveId,
+      HostCollectiveId: null,
+      // Compute amounts
+      amount,
+      netAmountInCollectiveCurrency: amount,
+      currency: currency,
+      amountInHostCurrency: amountInHostCurrency,
+      hostCurrency: hostCurrency,
+      hostCurrencyFxRate: hostCurrencyFxRate,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      taxAmount: 0,
+      OrderId: transaction.OrderId,
+      ExpenseId: transaction.ExpenseId,
+      isRefund: transaction.isRefund,
+      CreatedByUserId: transaction.CreatedByUserId,
+      createdAt: transaction.createdAt,
+      clearedAt: transaction.clearedAt || transaction.createdAt,
+      data: { ...data, ...pick(transaction.data, ['tax']) },
+    };
+
+    const taxTransaction = await Transaction.createDoubleEntry(taxTransactionData, { sequelizeTransaction });
+
+    // For expenses, tax needs to be added on top
+    // amount: -10000, taxAmount: -2000 -> amount: -12000, taxAmount: 0
+    if (transaction.kind === EXPENSE) {
+      transaction.amount = transaction.amount + transaction.taxAmount;
+      transaction.amountInHostCurrency = transaction.amount * transaction.hostCurrencyFxRate;
+    }
+
+    transaction.taxAmount = 0;
+    transaction.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+
+    return { transaction, taxTransaction };
+  }
+
+  static async createHostFeeShareTransactions(
+    {
+      transaction,
+      hostFeeTransaction,
+    }: {
+      transaction: Transaction | TransactionCreationAttributes;
+      hostFeeTransaction: Transaction;
+    },
+    { sequelizeTransaction }: { sequelizeTransaction?: SequelizeTransaction } = {},
+  ): Promise<{
+    hostFeeShareTransaction: Transaction;
+    hostFeeShareDebtTransaction: Transaction;
+  } | void> {
+    const host = await Transaction.fetchHost(transaction, { sqlTransaction: sequelizeTransaction });
+
+    let hostFeeSharePercent = transaction.data?.hostFeeSharePercent;
+    if (isNil(hostFeeSharePercent) && transaction.OrderId) {
+      const order = await Order.findByPk(transaction.OrderId, { transaction: sequelizeTransaction });
+      hostFeeSharePercent = await getHostFeeSharePercent(order);
+    }
+
+    if (!hostFeeSharePercent) {
+      return;
+    }
+
+    // Skip if missing or misconfigured
+    const hostFeeShareCollective = await Collective.findByPk(PlatformConstants.PlatformCollectiveId, {
+      transaction: sequelizeTransaction,
+    });
+    const hostFeeShareHostCollective = await Collective.findByPk(PlatformConstants.PlatformCollectiveId, {
+      transaction: sequelizeTransaction,
+    });
+    if (!hostFeeShareCollective || !hostFeeShareHostCollective) {
+      return;
+    }
+
+    // We use the Host Fee amountInHostCurrency/hostCurrency as a basis
+    const currency = hostFeeTransaction.hostCurrency;
+    const amount = calcFee(hostFeeTransaction.amountInHostCurrency, hostFeeSharePercent, currency);
+
+    // Skip if the amount is zero (e.g.: 15% * 0.03 = 0.0045 and rounded to 0)
+    if (amount === 0) {
+      return;
+    }
+
+    // This is a credit to Open Collective and needs to be inserted in USD
+    const hostCurrency = PlatformConstants.PlatformCurrency;
+    const hostCurrencyFxRate = await Transaction.getFxRate(currency, hostCurrency, transaction);
+    const amountInHostCurrency = roundCentsAmount(amount * hostCurrencyFxRate, hostCurrency);
+
+    const hostFeeShareTransactionData = {
+      type: CREDIT,
+      kind: TransactionKind.HOST_FEE_SHARE,
+      description: 'Host Fee Share',
+      TransactionGroup: hostFeeTransaction.TransactionGroup,
+      FromCollectiveId: host.id,
+      CollectiveId: PlatformConstants.PlatformCollectiveId,
+      HostCollectiveId: PlatformConstants.PlatformCollectiveId,
+      // Compute amounts
+      amount,
+      netAmountInCollectiveCurrency: amount,
+      currency,
+      amountInHostCurrency,
+      hostCurrency,
+      hostCurrencyFxRate,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      OrderId: hostFeeTransaction.OrderId,
+      createdAt: hostFeeTransaction.createdAt,
+      clearedAt: hostFeeTransaction.clearedAt || hostFeeTransaction.createdAt,
+    };
+
+    const hostFeeShareTransaction = await Transaction.createDoubleEntry(hostFeeShareTransactionData, {
+      sequelizeTransaction,
+    });
+
+    let hostFeeShareDebtTransaction;
+    if (!transaction.data.isPlatformRevenueDirectlyCollected) {
+      hostFeeShareDebtTransaction = await Transaction.createHostFeeShareDebtTransactions(
+        { hostFeeShareTransaction },
+        { sequelizeTransaction },
+      );
+    }
+
+    return { hostFeeShareTransaction, hostFeeShareDebtTransaction };
+  }
+
+  static async createHostFeeShareDebtTransactions(
+    {
+      hostFeeShareTransaction,
+    }: {
+      hostFeeShareTransaction: Transaction;
+    },
+    { sequelizeTransaction }: { sequelizeTransaction?: SequelizeTransaction } = {},
+  ): Promise<Transaction> {
+    if (hostFeeShareTransaction.type === DEBIT) {
+      throw new Error('createHostFeeShareDebtTransactions must be given a CREDIT transaction');
+    }
+
+    // Create debt transaction
+    const hostFeeShareDebtTransactionData = {
+      // Copy base values from the original CREDIT HOST_FEE_SHARE
+      ...pick(hostFeeShareTransaction.dataValues, [
+        'TransactionGroup',
+        'FromCollectiveId',
+        'CollectiveId',
+        'HostCollectiveId',
+        'OrderId',
+        'createdAt',
+        'clearedAt',
+        'currency',
+        'hostCurrency',
+        'hostCurrencyFxRate',
+      ]),
+      type: DEBIT,
+      kind: TransactionKind.HOST_FEE_SHARE_DEBT,
+      isDebt: true,
+      description: 'Host Fee Share owed to Open Collective',
+      // Opposite amounts
+      amount: -hostFeeShareTransaction.amount,
+      netAmountInCollectiveCurrency: -hostFeeShareTransaction.netAmountInCollectiveCurrency,
+      amountInHostCurrency: -hostFeeShareTransaction.amountInHostCurrency,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+    };
+
+    const hostFeeShareDebtTransaction = await Transaction.createDoubleEntry(hostFeeShareDebtTransactionData, {
+      sequelizeTransaction,
+    });
+
+    // Create settlement
+    const settlementStatus = TransactionSettlementStatus.OWED;
+    await TransactionSettlement.createForTransaction(
+      hostFeeShareDebtTransaction,
+      settlementStatus,
+      sequelizeTransaction,
+    );
+
+    return hostFeeShareDebtTransaction;
+  }
+
+  /**
+   * Creates a transaction pair from given payload. Defaults to `CONTRIBUTION` kind unless
+   * specified otherwise.
+   */
+  static async createFromContributionPayload(transaction: TransactionCreationAttributes): Promise<Transaction> {
+    try {
+      Transaction.validateContributionPayload(transaction);
+    } catch (error) {
+      throw new Error(`createFromContributionPayload: ${error.message}`);
+    }
+
+    // Retrieve Host
+    const collective = await Collective.findByPk(transaction.CollectiveId);
+    const host = await collective.getHostCollective();
+    transaction.HostCollectiveId = collective.hasMoneyManagement ? collective.id : host.id;
+    if (!transaction.HostCollectiveId) {
+      throw new Error(
+        `Cannot create transaction: Collective with id '${transaction.CollectiveId}' doesn't have a Host`,
+      );
+    }
+
+    // Compute these values, they will eventually be checked again by createDoubleEntry
+    transaction.TransactionGroup = uuid();
+    transaction.type = TransactionTypes.CREDIT;
+    transaction.kind = transaction.kind || TransactionKind.CONTRIBUTION;
+
+    // Some test may skip amountInHostCurrency and hostCurrency
+    if (!transaction.hostCurrency && !transaction.amountInHostCurrency) {
+      transaction.amountInHostCurrency = transaction.amount;
+      transaction.hostCurrency = transaction.currency;
+    }
+
+    transaction.hostFeeInHostCurrency = toNegative(transaction.hostFeeInHostCurrency) || 0;
+    transaction.platformFeeInHostCurrency = toNegative(transaction.platformFeeInHostCurrency) || 0;
+    transaction.paymentProcessorFeeInHostCurrency = toNegative(transaction.paymentProcessorFeeInHostCurrency) || 0;
+    transaction.taxAmount = toNegative(transaction.taxAmount);
+
+    transaction.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+
+    return Transaction.createDoubleEntry(transaction);
+  }
+
+  static async fetchHost(
+    transaction: Transaction | TransactionCreationAttributes,
+    { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+  ): Promise<Collective | null> {
+    let host;
+    if (transaction.HostCollectiveId) {
+      host = await Collective.findByPk(transaction.HostCollectiveId, { transaction: sqlTransaction });
+    }
+    if (!host) {
+      // throw new Error(`transaction.HostCollectiveId should always bet set`);
+      reportMessageToSentry(`transaction.HostCollectiveId should always bet set`, {
+        extra: { transaction: transaction.info },
+      });
+      const collective = await Collective.findByPk(transaction.CollectiveId, { transaction: sqlTransaction });
+      host = await collective.getHostCollective({ transaction: sqlTransaction });
+    }
+    return host;
+  }
+
+  static async createActivity(transaction: Transaction): Promise<Activity | void> {
+    if (transaction.deletedAt || ['TAX', 'PAYMENT_PROCESSOR_FEE'].includes(transaction.kind)) {
+      return Promise.resolve();
+    }
+    const transactionId = transaction.id;
+    return (
+      Transaction.findByPk(transactionId, {
+        include: [
+          { model: Collective, as: 'fromCollective' },
+          { model: Collective, as: 'collective' },
+          { model: User, as: 'createdByUser' },
+          { model: PaymentMethod },
+        ],
+      })
+        // Create activity.
+        .then(transaction => {
+          if (!transaction) {
+            reportMessageToSentry('Transaction not found when creating activity', {
+              extra: { transactionId },
+            });
+            return;
+          }
+
+          const activityPayload = {
+            type: activities.COLLECTIVE_TRANSACTION_CREATED,
+            TransactionId: transaction.id,
+            CollectiveId: transaction.CollectiveId,
+            UserId: transaction.CreatedByUserId,
+            FromCollectiveId: transaction.FromCollectiveId,
+            HostCollectiveId: transaction.HostCollectiveId,
+            OrderId: transaction.OrderId,
+            data: {
+              transaction: transaction.info,
+              user: transaction['User'] && transaction['User'].minimal, // TODO: `transaction.user` doesn't seem to exists, should be createdByUser?
+              fromCollective: transaction.fromCollective && transaction.fromCollective.minimal,
+              collective: transaction.collective && transaction.collective.minimal,
+            },
+          };
+          if (transaction.createdByUser) {
+            activityPayload.data.user = transaction.createdByUser.info;
+          }
+          if (transaction.PaymentMethod) {
+            activityPayload.data['paymentMethod'] = transaction.PaymentMethod.info;
+          }
+          return Activity.create(activityPayload);
+        })
+        .catch(err => {
+          reportErrorToSentry(err);
+        })
+    );
+  }
+
+  static canHaveFees({ kind }: Transaction | TransactionCreationAttributes): boolean {
+    return [CONTRIBUTION, EXPENSE, ADDED_FUNDS].includes(kind);
+  }
+
+  static calculateNetAmountInCollectiveCurrency({
+    amountInHostCurrency,
+    hostCurrencyFxRate,
+    hostFeeInHostCurrency,
+    paymentProcessorFeeInHostCurrency,
+    platformFeeInHostCurrency,
+    taxAmount,
+    currency,
+  }: Transaction | TransactionCreationAttributes): number {
+    const transactionFees = platformFeeInHostCurrency + hostFeeInHostCurrency + paymentProcessorFeeInHostCurrency;
+    const transactionTaxes = taxAmount || 0;
+    return roundCentsAmount(
+      (amountInHostCurrency + transactionFees) / (hostCurrencyFxRate || 1) + transactionTaxes,
+      currency,
+    );
+  }
+
+  static calculateNetAmountInHostCurrency({
+    amountInHostCurrency,
+    hostCurrencyFxRate,
+    hostFeeInHostCurrency,
+    paymentProcessorFeeInHostCurrency,
+    platformFeeInHostCurrency,
+    taxAmount,
+    hostCurrency,
+  }: Transaction | TransactionCreationAttributes): number {
+    const transactionFees = platformFeeInHostCurrency + hostFeeInHostCurrency + paymentProcessorFeeInHostCurrency;
+    const transactionTaxes = taxAmount || 0;
+    return roundCentsAmount(
+      amountInHostCurrency + transactionFees + transactionTaxes * (hostCurrencyFxRate || 1),
+      hostCurrency,
+    );
+  }
+
+  static async getFxRate(
+    fromCurrency: SupportedCurrency,
+    toCurrency: SupportedCurrency,
+    transaction?: Transaction | TransactionCreationAttributes,
+  ): Promise<number> {
+    if (fromCurrency === toCurrency) {
+      return 1;
+    }
+
+    // Simple Case
+    if (fromCurrency === transaction.currency && toCurrency === transaction.hostCurrency) {
+      return transaction.hostCurrencyFxRate;
+    }
+    if (fromCurrency === transaction.hostCurrency && toCurrency === transaction.currency) {
+      return 1 / transaction.hostCurrencyFxRate;
+    }
+
+    // For platform tips, we store the FX rate of the host<>currency
+    // TODO: The thingy below is useful for the migration of platform tips with debts, but
+    // we should ideally not rely on `data?.hostToPlatformFxRate` for that
+    if (transaction.data?.hostToPlatformFxRate) {
+      if (
+        toCurrency === PlatformConstants.PlatformCurrency &&
+        fromCurrency === transaction.hostCurrency &&
+        transaction.type === CREDIT &&
+        transaction.kind === TransactionKind.PLATFORM_TIP &&
+        transaction.FromCollectiveId === PlatformConstants.PlatformCollectiveId
+      ) {
+        return transaction.data.hostToPlatformFxRate;
+      }
+    }
+
+    // If Stripe transaction, we check if we have the rate stored locally
+    if (transaction.data?.balanceTransaction?.['exchange_rate']) {
+      if (
+        transaction.data.charge?.['currency'] === fromCurrency.toLowerCase() &&
+        transaction.data.balanceTransaction['currency'] === toCurrency.toLowerCase()
+      ) {
+        return transaction.data.balanceTransaction['exchange_rate'];
+      }
+      if (
+        transaction.data?.charge?.['currency'] === toCurrency.toLowerCase() &&
+        transaction.data?.balanceTransaction?.['currency'] === fromCurrency.toLowerCase()
+      ) {
+        return 1 / transaction.data.balanceTransaction['exchange_rate'];
+      }
+    }
+
+    // If Transferwise transaction, we check if we have the rate stored locally
+    if (transaction.data?.transfer?.['rate']) {
+      if (
+        transaction.data?.transfer?.['sourceCurrency'] === fromCurrency &&
+        transaction.data?.transfer?.['targetCurrency'] === toCurrency
+      ) {
+        return transaction.data.transfer['rate'];
+      }
+      if (
+        transaction.data?.transfer?.['sourceCurrency'] === toCurrency &&
+        transaction.data?.transfer?.['targetCurrency'] === fromCurrency
+      ) {
+        return 1 / transaction.data.transfer['rate'];
+      }
+    }
+
+    return getFxRate(fromCurrency, toCurrency, transaction.createdAt || 'latest');
+  }
+
+  static async updateCurrency(currency: SupportedCurrency, transaction: Transaction): Promise<Transaction> {
+    // Nothing to do
+    if (currency === transaction.currency) {
+      return transaction;
+    }
+
+    // Immediately convert taxAmount if necessary
+    // We don't store it in hostCurrency and can't populate like other values
+    if (transaction.taxAmount) {
+      const previousCurrency = transaction.currency;
+      const fxRate = await Transaction.getFxRate(previousCurrency, currency, transaction);
+      transaction.taxAmount = roundCentsAmount(transaction.taxAmount * fxRate, currency);
+    }
+
+    transaction.currency = currency;
+    transaction.hostCurrencyFxRate = await Transaction.getFxRate(
+      transaction.currency,
+      transaction.hostCurrency,
+      transaction,
+    );
+
+    // REMINDER: amount * hostCurrencyFxRate = amountInHostCurrency
+    // so: amount = amountInHostCurrency / hostCurrencyFxRate
+    transaction.amount = roundCentsAmount(transaction.amountInHostCurrency / transaction.hostCurrencyFxRate, currency);
+    transaction.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+
+    return transaction;
+  }
+
+  /**
+   * To validate that the different amounts are correct.
+   *
+   * @param {Transaction} transaction
+   * @param {Object} options
+   * @param {Boolean} options.validateOppositeTransaction
+   * @param {Transaction} options.oppositeTransaction the opposite transaction to validate. Will be fetched if not provided and validateOppositeTransaction is true.
+   * @returns
+   */
+  static async validate(
+    transaction: Transaction,
+    { validateOppositeTransaction = true, oppositeTransaction = null, sqlTransaction = undefined } = {},
+  ) {
+    // Skip as there is a known bug there
+    // https://github.com/opencollective/opencollective/issues/3935
+    if (transaction.kind === TransactionKind.PLATFORM_TIP) {
+      return;
+    }
+
+    for (const key of [
+      'uuid',
+      'TransactionGroup',
+      'amount',
+      'currency',
+      'amountInHostCurrency',
+      'hostCurrency',
+      'hostCurrencyFxRate',
+      'netAmountInCollectiveCurrency',
+      'hostFeeInHostCurrency',
+      'platformFeeInHostCurrency',
+      'paymentProcessorFeeInHostCurrency',
+    ]) {
+      assert(!isNil(transaction[key]), `${key} should be set`);
+    }
+
+    const hostCurrencyFxRate = transaction.hostCurrencyFxRate || 1;
+
+    Transaction.assertAmountsLooselyEqual(
+      roundCentsAmount(transaction.amountInHostCurrency / hostCurrencyFxRate, transaction.currency),
+      transaction.amount,
+      'amountInHostCurrency should match amount',
+    );
+
+    const netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+    Transaction.assertAmountsLooselyEqual(
+      transaction.netAmountInCollectiveCurrency,
+      netAmountInCollectiveCurrency,
+      'netAmountInCollectiveCurrency should be accurate',
+    );
+
+    if (transaction.currency === transaction.hostCurrency) {
+      assert(
+        transaction.hostCurrencyFxRate === 1,
+        `hostCurrencyFxRate should be 1, got ${transaction.hostCurrencyFxRate}`,
+      );
+    } else if (transaction.hostCurrencyFxRate === 1) {
+      // Through rare two currencies can still have the same value
+      logger.warn(
+        `hostCurrencyFxRate is 1 for transaction ${transaction.id} (${transaction.currency}/${transaction.hostCurrency})`,
+      );
+    }
+
+    if (!validateOppositeTransaction) {
+      return;
+    }
+
+    // Stop there in this case, no need to check oppositeTransaction as it doesn't exist
+    if (transaction.CollectiveId === transaction.FromCollectiveId) {
+      return;
+    }
+
+    oppositeTransaction = oppositeTransaction || (await transaction.getOppositeTransaction(null, { sqlTransaction }));
+    assert(oppositeTransaction, 'oppositeTransaction should be existing');
+
+    // Ideally, but we should not enforce it at this point
+    /*
+    assert(transaction.currency === oppositeTransaction.currency, 'oppositeTransaction currency should match');
+    Transaction.assertAmountsStrictlyEqual(
+      oppositeTransaction.netAmountInCollectiveCurrency,
+      -1 * transaction.amount,
+      'netAmountInCollectiveCurrency in oppositeTransaction should match',
+    );
+    Transaction.assertAmountsStrictlyEqual(
+      oppositeTransaction.amount,
+      -1 * transaction.netAmountInCollectiveCurrency,
+      'amount in oppositeTransaction should match',
+    );
+    */
+
+    const oppositeTransactionHostCurrencyFxRate =
+      // Use the one stored locally in oppositeTransaction
+      <number>oppositeTransaction.data?.oppositeTransactionHostCurrencyFxRate ||
+      <number>oppositeTransaction.data?.oppositeTransactionFeesCurrencyFxRate ||
+      // Use the one stored locally in transaction
+      // prettier-ignore
+      (transaction.data?.oppositeTransactionHostCurrencyFxRate
+        ? (1 / <number>transaction.data?.oppositeTransactionHostCurrencyFxRate)
+        : null) ||
+      // prettier-ignore
+      (transaction.data?.oppositeTransactionFeesCurrencyFxRate
+        ? (1 / <number>transaction.data?.oppositeTransactionFeesCurrencyFxRate)
+        : null) ||
+      // Fetch from getFxRate
+      (await Transaction.getFxRate(transaction.hostCurrency, oppositeTransaction.hostCurrency, transaction));
+
+    Transaction.assertAmountsStrictlyEqual(
+      oppositeTransaction.platformFeeInHostCurrency || 0,
+      roundCentsAmount(
+        (transaction.platformFeeInHostCurrency || 0) * oppositeTransactionHostCurrencyFxRate,
+        transaction.hostCurrency,
+      ),
+      'platformFeeInHostCurrency in oppositeTransaction should match',
+    );
+
+    Transaction.assertAmountsStrictlyEqual(
+      oppositeTransaction.hostFeeInHostCurrency || 0,
+      roundCentsAmount(
+        (transaction.hostFeeInHostCurrency || 0) * oppositeTransactionHostCurrencyFxRate,
+        transaction.hostCurrency,
+      ),
+      'hostFeeInHostCurrency in oppositeTransaction should match',
+    );
+
+    Transaction.assertAmountsStrictlyEqual(
+      oppositeTransaction.paymentProcessorFeeInHostCurrency || 0,
+      roundCentsAmount(
+        (transaction.paymentProcessorFeeInHostCurrency || 0) * oppositeTransactionHostCurrencyFxRate,
+        transaction.hostCurrency,
+      ),
+      'paymentProcessorFeeInHostCurrency in oppositeTransaction should match',
+    );
+
+    /*
+    Transaction.assertAmountsStrictlyEqual(
+      oppositeTransaction.amountInHostCurrency,
+      Math.round(transaction.netAmountInCollectiveCurrency * oppositeTransactionHostCurrencyFxRate),
+      'amountInHostCurrency in oppositeTransaction should match',
+    );
+
+    Transaction.assertAmountsLooselyEqual(
+      oppositeTransaction.amount,
+      -Math.round(transaction.netAmountInCollectiveCurrency * oppositeTransactionCurrencyFxRate),
+      'amount in oppositeTransaction should match',
+    );
+    */
+  }
+
+  static assertAmountsStrictlyEqual(actual, expected, message) {
+    assert.equal(actual, expected, `${message}: ${actual} doesn't strictly equal to ${expected}`);
+  }
+
+  static assertAmountsLooselyEqual(actual, expected, message) {
+    assert(Math.abs(actual - expected) <= 100, `${message}: ${actual} doesn't loosely equal to ${expected}`);
+  }
+}
+
+// Ideally, this should be `InferCreationAttributes<Transaction>` but for some reason
+// Typescript is not respecting the `CreationOptional` type and makes all attributes required.
+export type TransactionCreationAttributes = Partial<Transaction>;
+
+Transaction.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    publicId: {
+      type: DataTypes.STRING,
+      unique: true,
+    },
+
+    type: DataTypes.STRING, // DEBIT or CREDIT
+
+    kind: {
+      allowNull: true,
+      type: DataTypes.ENUM(...Object.values(TransactionKind)),
+    },
+
+    uuid: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      unique: true,
+    },
+
+    description: DataTypes.STRING,
+    amount: DataTypes.INTEGER,
+
+    currency: CustomDataTypes(DataTypes).currency,
+
+    CreatedByUserId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'Users',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true, // we allow CreatedByUserId to be null but only on refund transactions
+      validate: {
+        isValid(value) {
+          if (isNull(value) && this.isRefund === false) {
+            throw new Error('Only refund transactions can have null user.');
+          }
+        },
+      },
+    },
+
+    // Source of the money for a DEBIT
+    // Recipient of the money for a CREDIT
+    FromCollectiveId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'Collectives',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true, // when a host adds funds, we need to create a transaction to add money to the system (to the host collective)
+    },
+
+    CollectiveId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'Collectives',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: false,
+    },
+
+    // Keeps a reference to the host because this is where the bank account is
+    // Note that the host can also change over time (that's why just keeping CollectiveId is not enough)
+    HostCollectiveId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'Collectives',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true, // the opposite transaction that records the CREDIT to the User that submitted an expense doesn't have a HostCollectiveId, see https://github.com/opencollective/opencollective/issues/1154
+    },
+
+    UsingGiftCardFromCollectiveId: {
+      type: DataTypes.INTEGER,
+      references: { model: 'Collectives', key: 'id' },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true,
+    },
+
+    OrderId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'Orders',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true,
+    },
+
+    // Refactor: an Expense should be an Order
+    ExpenseId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'Expenses',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true,
+    },
+
+    PaymentIntentId: {
+      type: DataTypes.INTEGER,
+      references: {
+        model: 'PaymentIntents',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true,
+    },
+
+    // stores the currency that the transaction happened in (currency of the host)
+    hostCurrency: {
+      type: DataTypes.STRING,
+      set(val: string) {
+        if (val && val.toUpperCase) {
+          this.setDataValue('hostCurrency', val.toUpperCase() as SupportedCurrency);
+        }
+      },
+    },
+
+    // stores the foreign exchange rate at the time of transaction between donation currency and transaction currency
+    // amountInCollectiveCurrency * hostCurrencyFxRate = amountInHostCurrency
+    // Expense amount * hostCurrencyFxRate = amountInHostCurrency
+    hostCurrencyFxRate: {
+      type: DataTypes.FLOAT,
+      allowNull: false,
+      defaultValue: 1,
+    },
+
+    // amount in currency of the host
+    amountInHostCurrency: DataTypes.INTEGER,
+    platformFeeInHostCurrency: DataTypes.INTEGER,
+    hostFeeInHostCurrency: DataTypes.INTEGER,
+    paymentProcessorFeeInHostCurrency: DataTypes.INTEGER,
+
+    // amount in transaction currency
+    taxAmount: { type: DataTypes.INTEGER },
+
+    /**
+     * TODO: Rename this field, as it's always expressed with `currency`. It should just be `netAmount`
+     */
+    netAmountInCollectiveCurrency: DataTypes.INTEGER, // stores the net amount received by the collective (after fees) or removed from the collective (including fees)
+
+    data: DataTypes.JSONB,
+
+    // Note: Not a foreign key, should have been lower case t, 'transactionGroup`
+    TransactionGroup: {
+      type: DataTypes.UUID,
+    },
+
+    RefundTransactionId: {
+      type: DataTypes.INTEGER,
+      references: { model: 'Transactions', key: 'id' },
+    },
+
+    refundKind: {
+      type: DataTypes.ENUM(...Object.values(RefundKind)),
+      allowNull: true,
+    },
+
+    PaymentMethodId: {
+      type: DataTypes.INTEGER,
+      references: { model: 'PaymentMethods', key: 'id' },
+      allowNull: true,
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+    },
+
+    PayoutMethodId: {
+      type: DataTypes.INTEGER,
+      references: { key: 'id', model: 'PayoutMethods' },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true,
+    },
+
+    isRefund: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+
+    isDebt: {
+      type: DataTypes.BOOLEAN,
+      allowNull: true,
+    },
+
+    isDisputed: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+
+    isInReview: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+
+    isInternal: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+      allowNull: false,
+    },
+
+    createdAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+    },
+
+    updatedAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+    },
+
+    deletedAt: {
+      type: DataTypes.DATE,
+    },
+
+    clearedAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+    },
+
+    /** A virtual field to make working with settlements easier. Must be preloaded manually. */
+    settlementStatus: {
+      type: DataTypes.VIRTUAL,
+    },
+  },
+  {
+    sequelize,
+    paranoid: true,
+
+    getterMethods: {
+      netAmountInHostCurrency() {
+        return Transaction.calculateNetAmountInHostCurrency(this);
+      },
+
+      amountSentToHostInHostCurrency() {
+        return this.amountInHostCurrency + this.paymentProcessorFeeInHostCurrency + this.platformFeeInHostCurrency;
+      },
+
+      // Info.
+      // Warning: Only add public fields in there, as the raw object is shared through webhooks
+      info() {
+        return {
+          id: this.id,
+          uuid: this.uuid,
+          group: this.TransactionGroup,
+          type: this.type,
+          kind: this.kind,
+          description: this.description,
+          amount: this.amount,
+          currency: this.currency,
+          createdAt: this.createdAt,
+          clearedAt: this.clearedAt,
+          CreatedByUserId: this.CreatedByUserId,
+          FromCollectiveId: this.FromCollectiveId,
+          CollectiveId: this.CollectiveId,
+          UsingGiftCardFromCollectiveId: this.UsingGiftCardFromCollectiveId,
+          // platformFee: this.platformFee,
+          platformFeeInHostCurrency: this.platformFeeInHostCurrency,
+          // hostFee: this.hostFee,
+          hostFeeInHostCurrency: this.hostFeeInHostCurrency,
+          paymentProcessorFeeInHostCurrency: this.paymentProcessorFeeInHostCurrency,
+          amountInHostCurrency: this.amountInHostCurrency,
+          netAmountInCollectiveCurrency: this.netAmountInCollectiveCurrency,
+          netAmountInHostCurrency: this.netAmountInHostCurrency,
+          amountSentToHostInHostCurrency: this.amountSentToHostInHostCurrency,
+          taxAmount: this.taxAmount,
+          hostCurrency: this.hostCurrency,
+          ExpenseId: this.ExpenseId,
+          OrderId: this.OrderId,
+          isRefund: this.isRefund,
+          isDebt: this.isDebt,
+        };
+      },
+
+      merchantId() {
+        return head(compact(MERCHANT_ID_PATHS[this.kind]?.map(path => get(this, path))));
+      },
+    },
+
+    hooks: {
+      afterCreate: (transaction: Transaction, options): void => {
+        if (!shouldGenerateTransactionActivities(transaction.CollectiveId)) {
+          return null;
+        } else if (options.transaction) {
+          options.transaction.afterCommit(() => void Transaction.createActivity(transaction));
+        } else {
+          Transaction.createActivity(transaction);
+        }
+      },
+    },
+  },
+);
+
+/**
+ * Instance Methods
+ */
+Transaction.prototype.getUser = function () {
+  return User.findByPk(this.CreatedByUserId);
+};
+
+Transaction.prototype.getGiftCardEmitterCollective = function () {
+  if (this.UsingGiftCardFromCollectiveId) {
+    return Collective.findByPk(this.UsingGiftCardFromCollectiveId);
+  }
+};
+
+Transaction.prototype.getHostCollective = async function ({ loaders = undefined } = {}) {
+  let HostCollectiveId = this.HostCollectiveId;
+  // if the transaction is from the perspective of the fromCollective
+  if (!HostCollectiveId) {
+    const fromCollective = loaders
+      ? await loaders.Collective.byId.load(this.FromCollectiveId)
+      : await Collective.findByPk(this.FromCollectiveId);
+    HostCollectiveId = await fromCollective.getHostCollectiveId();
+  }
+  return loaders ? loaders.Collective.byId.load(HostCollectiveId) : Collective.findByPk(HostCollectiveId);
+};
+
+Transaction.prototype.getSource = function () {
+  if (this.OrderId) {
+    return this.getOrder({ paranoid: false });
+  }
+  if (this.ExpenseId) {
+    return this.getExpense({ paranoid: false });
+  }
+};
+
+/**
+ * Returns the transaction payment method provider collective ID, which is
+ * either the gift card provider if using a gift card or
+ * `CollectiveId` otherwise.
+ */
+Transaction.prototype.paymentMethodProviderCollectiveId = function () {
+  if (this.UsingGiftCardFromCollectiveId) {
+    return this.UsingGiftCardFromCollectiveId;
+  }
+  return this.type === 'DEBIT' ? this.CollectiveId : this.FromCollectiveId;
+};
+
+Transaction.prototype.getRefundTransaction = function (): Promise<Transaction | null> {
+  if (!this.RefundTransactionId) {
+    return null;
+  }
+  return Transaction.findByPk(this.RefundTransactionId);
+};
+
+Transaction.prototype.hasPlatformTip = function (): boolean {
+  return Boolean(
+    this.data?.hasPlatformTip &&
+    this.kind !== TransactionKind.PLATFORM_TIP &&
+    this.kind !== TransactionKind.PLATFORM_TIP_DEBT,
+  );
+};
+
+Transaction.prototype.getRelatedTransaction = function (
+  options: Pick<Transaction, 'type' | 'kind' | 'isDebt'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+): Promise<Transaction | null> {
+  return Transaction.findOne({
+    where: {
+      TransactionGroup: this.TransactionGroup,
+      type: options.type || this.type,
+      kind: options.kind || this.kind,
+      isDebt: options.isDebt || { [Op.not]: true },
+    },
+    transaction: sqlTransaction,
+  });
+};
+
+Transaction.prototype.getRelatedTransactions = function (
+  options: Pick<Transaction, 'type' | 'kind' | 'isDebt'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+): Promise<Transaction[] | null> {
+  return Transaction.findAll({
+    transaction: sqlTransaction,
+    where: {
+      TransactionGroup: this.TransactionGroup,
+      type: options.type || this.type,
+      kind: options.kind || this.kind,
+      isDebt: options.isDebt || { [Op.not]: true },
+    },
+  });
+};
+
+Transaction.prototype.getPaymentProcessorFeeTransaction = function (
+  options?: Pick<Transaction, 'type'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+) {
+  return this.getRelatedTransaction({ ...options, kind: TransactionKind.PAYMENT_PROCESSOR_FEE }, { sqlTransaction });
+};
+
+Transaction.prototype.getTaxTransaction = function (
+  options?: Pick<Transaction, 'type'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+) {
+  return this.getRelatedTransaction({ ...options, kind: TransactionKind.TAX }, { sqlTransaction });
+};
+
+Transaction.prototype.getPlatformTipTransaction = function (
+  options?: Pick<Transaction, 'type'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+) {
+  return this.getRelatedTransaction({ ...options, kind: TransactionKind.PLATFORM_TIP }, { sqlTransaction });
+};
+
+Transaction.prototype.getPlatformTipDebtTransaction = function (
+  options?: Pick<Transaction, 'type'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+) {
+  return this.getRelatedTransaction(
+    { ...options, kind: TransactionKind.PLATFORM_TIP_DEBT, isDebt: true },
+    { sqlTransaction },
+  );
+};
+
+Transaction.prototype.getHostFeeTransaction = function (
+  options?: Pick<Transaction, 'type'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+) {
+  return this.getRelatedTransaction({ ...options, kind: TransactionKind.HOST_FEE }, { sqlTransaction });
+};
+
+Transaction.prototype.getHostFeeShareTransaction = function (
+  options?: Pick<Transaction, 'type'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+) {
+  return this.getRelatedTransaction({ ...options, kind: TransactionKind.HOST_FEE_SHARE }, { sqlTransaction });
+};
+
+Transaction.prototype.getHostFeeShareDebtTransaction = function (
+  options?: Pick<Transaction, 'type'>,
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+) {
+  return this.getRelatedTransaction(
+    { ...options, kind: TransactionKind.HOST_FEE_SHARE_DEBT, isDebt: true },
+    { sqlTransaction },
+  );
+};
+
+Transaction.prototype.getOppositeTransaction = async function (
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _optionsPlaceholder = null, // To keep a similar signature to the other getRelatedTransaction methods
+  { sqlTransaction }: { sqlTransaction?: SequelizeTransaction } = {},
+) {
+  return this.getRelatedTransaction(
+    { type: this.type === CREDIT ? DEBIT : CREDIT, isDebt: this.isDebt },
+    { sqlTransaction },
+  );
+};
+
+Transaction.prototype.setCurrency = async function (currency) {
+  // Nothing to do
+  if (currency === this.currency) {
+    return this;
+  }
+
+  await Transaction.updateCurrency(currency, this);
+
+  return this.save();
+};
+
+export default Transaction;

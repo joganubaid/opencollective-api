@@ -1,0 +1,98 @@
+Subject: New financial contributor to {{{collective.name}}}: {{{member.memberCollective.name}}} {{#if order}}{{formatOrderAmountWithInterval order}}{{/if}}
+
+{{> header}}
+
+<h1>🎉 New financial contributor</h1>
+
+<p>{{> greeting }}</p>
+
+<p>{{#if member.memberCollective.isIncognito}}Someone (incognito){{else}}<a
+    href="{{config.host.website}}/{{member.memberCollective.slug}}">{{member.memberCollective.name}}</a>{{/if}} has become a new financial contributor to
+<a href="{{config.host.website}}{{collective.urlPath}}">{{collective.name}}</a>.</p>
+
+{{#if order.publicMessage}}
+  <p class="pullQuote">“{{order.publicMessage}}”<br />- {{member.memberCollective.name}}</p>
+{{/if}}
+
+{{#if member.memberCollective.isIncognito}}
+{{else}}
+<h2>About {{member.memberCollective.name}}</h2>
+<table>
+  <tr>
+    {{#if member.memberCollective.previewImage}}
+    <td>
+      <a href="{{config.host.website}}/{{member.memberCollective.slug}}">
+        <img src="{{member.memberCollective.previewImage}}" height="64" /><br />
+      </a>
+    </td>
+    <td width="10"></td>
+    {{/if}}
+    <td>
+      {{#if member.memberCollective.company}}
+      <b>Company:</b>{{member.memberCollective.company}}<br />
+      {{/if}}
+
+      {{member.memberCollective.description}}<br />
+
+      <a href="{{member.memberCollective.website}}">{{member.memberCollective.website}}</a>
+      {{#if member.memberCollective.twitterHandle}}
+      &nbsp;·&nbsp;
+      <a
+        href="https://twitter.com/{{member.memberCollective.twitterHandle}}">@{{member.memberCollective.twitterHandle}}</a><br />
+      {{/if}}
+      <br />
+      <a
+        href="{{config.host.website}}/{{member.memberCollective.slug}}">{{config.host.website}}/{{member.memberCollective.slug}}</a>
+    </td>
+  </tr>
+</table>
+{{/if}}
+
+{{#if order }}
+<h2>Order</h2>
+<p>{{order.description}}</p>
+<table>
+  {{#if order.tier}}
+  <tr>
+    <th>{{capitalize order.tier.type}}:</th>
+    <td>{{order.tier.name}}</td>
+  </tr>
+  {{/if}}
+  {{#ifCond order.quantity '>' 1}}
+  <tr>
+    <th>Quantity:</th>
+    <td>{{order.quantity}}</td>
+  </tr>
+  {{/ifCond}}
+  <tr>
+    <th>Amount:</th>
+    <td>
+      {{currency order.netAmount currency=order.currency}}
+      {{#if order.platformTipAmount}}
+        (+ {{currency order.platformTipAmount currency=order.currency}} tip to the Open Collective Platform)
+      {{/if}}
+    </td>
+  </tr>
+  {{#if order.subscription}}
+  {{#if order.subscription.interval}}
+  <tr>
+    <th>Frequency:</th>
+    <td>{{order.subscription.interval}}</td>
+  </tr>
+  {{/if}}
+  {{else}}
+  <tr>
+    <th>Frequency:</th>
+    <td>one time</td>
+  </tr>
+  {{/if}}
+  {{#if order.publicMessage}}
+  <tr>
+    <th>Public message:</th>
+    <td>{{order.publicMessage}}</td>
+  </tr>
+  {{/if}}
+</table>
+{{/if}}
+
+{{> footer}}

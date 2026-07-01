@@ -1,0 +1,1315 @@
+import { expect } from 'chai';
+import moment from 'moment';
+import { PlaidApi } from 'plaid';
+import sinon from 'sinon';
+
+import { activities } from '../../../server/constants';
+import { Service } from '../../../server/constants/connected-account';
+import ExpenseStatuses from '../../../server/constants/expense-status';
+import ExpenseType from '../../../server/constants/expense-type';
+import FEATURE from '../../../server/constants/feature';
+import { PlatformSubscriptionPlan, PlatformSubscriptionTiers } from '../../../server/constants/plans';
+import * as GoCardlessConnect from '../../../server/lib/gocardless/connect';
+import * as PlaidClient from '../../../server/lib/plaid/client';
+import * as SentryLib from '../../../server/lib/sentry';
+import { Activity, PlatformSubscription, RequiredLegalDocument } from '../../../server/models';
+import {
+  BillingMonth,
+  BillingPeriod,
+  consolidateSubscriptionsForBillingPeriod,
+  UtilizationType,
+} from '../../../server/models/PlatformSubscription';
+import {
+  fakeActiveHost,
+  fakeActivity,
+  fakeCollective,
+  fakeConnectedAccount,
+  fakeEvent,
+  fakeExpense,
+  fakeProject,
+  fakeRequiredLegalDocument,
+  fakeTransaction,
+  fakeTransactionsImport,
+  fakeTransactionsImportRow,
+  fakeUser,
+} from '../../test-helpers/fake-data';
+import { resetTestDB } from '../../utils';
+
+async function fakeExpensePaidWithActivity(data) {
+  const expense = await fakeExpense(data);
+
+  await fakeActivity({
+    type: activities.COLLECTIVE_EXPENSE_PAID,
+    HostCollectiveId: expense.HostCollectiveId,
+    CollectiveId: expense.CollectiveId,
+    ExpenseId: expense.id,
+    createdAt: expense.createdAt,
+  });
+
+  return expense;
+}
+
+describe('server/models/PlatformSubscriptions', () => {
+  let sandbox: sinon.SinonSandbox;
+
+  before(() => {
+    sandbox = sinon.createSandbox();
+  });
+
+  afterEach(() => {
+    sandbox.restore();
+  });
+
+  describe('loaders.hasPlatformTips', () => {
+    beforeEach(async () => {
+      await resetTestDB();
+    });
+
+    it('returns undefined when the collective has no platform subscription', async () => {
+      const collective = await fakeCollective();
+      const { hasPlatformTips } = PlatformSubscription.loaders;
+      await expect(hasPlatformTips.load(collective.id)).to.eventually.equal(undefined);
+    });
+
+    it('returns true when the plan has pricing.platformTips true', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      const plan = PlatformSubscriptionTiers.find(t => t.id === 'discover-1');
+      await PlatformSubscription.createSubscription(collective, new Date(Date.UTC(2016, 0, 1)), plan, admin);
+      const { hasPlatformTips } = PlatformSubscription.loaders;
+      await expect(hasPlatformTips.load(collective.id)).to.eventually.equal(true);
+    });
+
+    it('returns false when the plan has pricing.platformTips false', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      const base = PlatformSubscriptionTiers.find(t => t.id === 'basic-5');
+      await PlatformSubscription.createSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 1)),
+        {
+          title: 'Custom',
+          pricing: { ...base.pricing, platformTips: false },
+        },
+        admin,
+      );
+      const { hasPlatformTips } = PlatformSubscription.loaders;
+      await expect(hasPlatformTips.load(collective.id)).to.eventually.equal(false);
+    });
+
+    it('resolves multiple collective ids in one batch', async () => {
+      const admin = await fakeUser();
+      const withTips = await fakeCollective({ admin });
+      const withoutSub = await fakeCollective();
+      const discoverPlan = PlatformSubscriptionTiers.find(t => t.id === 'discover-1');
+      await PlatformSubscription.createSubscription(withTips, new Date(Date.UTC(2016, 0, 1)), discoverPlan, admin);
+
+      const { hasPlatformTips } = PlatformSubscription.loaders;
+      const [a, b] = await Promise.all([hasPlatformTips.load(withTips.id), hasPlatformTips.load(withoutSub.id)]);
+      expect(a).to.equal(true);
+      expect(b).to.equal(undefined);
+    });
+
+    it('uses only the currently active subscription when the host changed plans', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      const discoverPlan = PlatformSubscriptionTiers.find(t => t.id === 'discover-1');
+      await PlatformSubscription.createSubscription(collective, new Date(Date.UTC(2016, 0, 1)), discoverPlan, admin);
+
+      const base = PlatformSubscriptionTiers.find(t => t.id === 'basic-5');
+      await PlatformSubscription.replaceCurrentSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 10)),
+        {
+          title: 'Custom',
+          pricing: { ...base.pricing, platformTips: false },
+        },
+        admin,
+      );
+
+      const { hasPlatformTips } = PlatformSubscription.loaders;
+      await expect(hasPlatformTips.load(collective.id)).to.eventually.equal(false);
+    });
+
+    it('returns undefined when the only subscription rows are not active in the current period', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      const discoverPlan = PlatformSubscriptionTiers.find(t => t.id === 'discover-1');
+      await PlatformSubscription.createSubscription(collective, new Date(Date.UTC(2016, 0, 1)), discoverPlan, admin);
+      const sub = await PlatformSubscription.getCurrentSubscription(collective.id);
+      await sub.update({
+        period: [sub.start, { value: new Date(Date.UTC(2016, 0, 15)), inclusive: false }],
+      });
+
+      const { hasPlatformTips } = PlatformSubscription.loaders;
+      await expect(hasPlatformTips.load(collective.id)).to.eventually.equal(undefined);
+    });
+  });
+
+  describe('getCurrentSubscription', () => {
+    it('returns null if no platform subscription for collective id', async () => {
+      const collective = await fakeCollective();
+      expect(PlatformSubscription.getCurrentSubscription(collective.id)).to.eventually.equal(null);
+    });
+
+    it('returns platform subscription if has overlap for collective id', async () => {
+      const collective = await fakeCollective();
+      const subscription = await PlatformSubscription.create({
+        CollectiveId: collective.id,
+        period: [
+          { value: new Date(Date.UTC(2016, 0, 1)), inclusive: false },
+          { value: new Date(Date.UTC(2016, 0, 2)), inclusive: true },
+        ],
+      });
+      await expect(
+        PlatformSubscription.getCurrentSubscription(collective.id, { now: () => new Date(Date.UTC(2016, 0, 1)) }),
+      ).to.eventually.equal(null);
+
+      await expect(
+        PlatformSubscription.getCurrentSubscription(collective.id, { now: () => new Date(Date.UTC(2016, 0, 2)) }),
+      )
+        .to.eventually.property('id')
+        .equal(subscription.id);
+    });
+  });
+
+  describe('createSubscription', () => {
+    it('throws when creating overlapping periods', async () => {
+      const collective = await fakeCollective();
+      await expect(
+        PlatformSubscription.create({
+          CollectiveId: collective.id,
+          period: [
+            { value: new Date(Date.UTC(2016, 0, 1)), inclusive: false },
+            { value: new Date(Date.UTC(2016, 0, 6)), inclusive: true },
+          ],
+        }),
+      ).to.be.fulfilled;
+
+      await expect(
+        PlatformSubscription.create({
+          CollectiveId: collective.id,
+          period: [
+            { value: new Date(Date.UTC(2016, 0, 5)), inclusive: false },
+            { value: new Date(Date.UTC(2016, 0, 9)), inclusive: true },
+          ],
+        }),
+      ).to.be.rejectedWith(Error);
+    });
+
+    it('creates a subscription if not existing current subscription', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      const subscription = await PlatformSubscription.createSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 1, 22, 22, 3)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+
+      expect(subscription.start.inclusive).to.be.true;
+      expect(moment.utc(subscription.start.value).toISOString()).to.equal('2016-01-01T00:00:00.000Z');
+
+      expect(subscription.end.inclusive).to.be.true;
+      expect(subscription.end.value).to.equal(Infinity);
+    });
+
+    it('throws if subscription already exists', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      await PlatformSubscription.createSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 1, 22, 11, 2)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+
+      await expect(
+        PlatformSubscription.createSubscription(
+          collective,
+          new Date(Date.UTC(2016, 0, 2)),
+          {
+            title: 'A plan',
+          },
+          admin,
+        ),
+      ).to.be.rejectedWith(Error);
+    });
+
+    it('emits PLATFORM_SUBSCRIPTION_UPDATED activity', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      const planData = {
+        title: 'Basic Plan',
+        id: 'basic-5',
+      };
+
+      await PlatformSubscription.createSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 1, 22, 22, 3)),
+        planData,
+        admin,
+      );
+
+      // Check that activity was created
+      const activity = await Activity.findOne({
+        where: {
+          CollectiveId: collective.id,
+          type: activities.PLATFORM_SUBSCRIPTION_UPDATED,
+        },
+      });
+
+      expect(activity).to.not.be.null;
+      expect(activity.data).to.have.property('previousPlan');
+      expect(activity.data).to.have.property('newPlan');
+      expect(activity.data.previousPlan).to.be.null; // No previous plan when creating first subscription
+      expect(activity.data.newPlan.title).to.equal('Basic Plan');
+      expect(activity.data.newPlan.id).to.equal('basic-5');
+    });
+  });
+
+  describe('replaceCurrentSubscription', () => {
+    it('replaces existing period if less than a full day', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      const subscription = await PlatformSubscription.createSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+
+      expect(subscription.start.inclusive).to.be.true;
+      expect(moment.utc(subscription.start.value).toISOString()).to.equal('2016-01-01T00:00:00.000Z');
+
+      expect(subscription.end.inclusive).to.be.true;
+      expect(subscription.end.value).to.equal(Infinity);
+
+      const newSubscription = await PlatformSubscription.replaceCurrentSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 1, 10, 1, 1)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+
+      await subscription.reload({
+        paranoid: false,
+      });
+      expect(subscription.deletedAt).to.not.be.null;
+
+      expect(newSubscription.start.inclusive).to.be.true;
+      expect(moment.utc(newSubscription.start.value).toISOString()).to.equal('2016-01-01T00:00:00.000Z');
+
+      expect(newSubscription.end.inclusive).to.be.true;
+      expect(newSubscription.end.value).to.equal(Infinity);
+    });
+
+    it('ends existing period and start new until end of month', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+      const subscription = await PlatformSubscription.createSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+
+      expect(subscription.start.inclusive).to.be.true;
+      expect(moment.utc(subscription.start.value).toISOString()).to.equal('2016-01-01T00:00:00.000Z');
+
+      expect(subscription.end.inclusive).to.be.true;
+      expect(subscription.end.value).to.equal(Infinity);
+
+      const newSubscription = await PlatformSubscription.replaceCurrentSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 2, 22, 3)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+
+      await subscription.reload();
+      expect(subscription.start.inclusive).to.be.true;
+      expect(moment.utc(subscription.start.value).toISOString()).to.equal('2016-01-01T00:00:00.000Z');
+
+      expect(subscription.end.inclusive).to.be.false;
+      expect(moment.utc(subscription.end.value).toISOString()).to.equal('2016-01-02T00:00:00.000Z');
+
+      expect(newSubscription.start.inclusive).to.be.true;
+      expect(moment.utc(newSubscription.start.value).toISOString()).to.equal('2016-01-02T00:00:00.000Z');
+
+      expect(newSubscription.end.inclusive).to.be.true;
+      expect(newSubscription.end.value).to.equal(Infinity);
+    });
+
+    it('emits PLATFORM_SUBSCRIPTION_UPDATED activity with legacy and new plan details', async () => {
+      const admin = await fakeUser();
+      const collective = await fakeCollective({ admin });
+
+      // Create initial subscription
+      const initialPlan = {
+        title: 'Initial Plan',
+        id: 'initial-1',
+      };
+
+      await PlatformSubscription.createSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+        initialPlan,
+        admin,
+      );
+
+      // Replace with new subscription
+      const newPlan = {
+        title: 'New Plan',
+        id: 'new-5',
+      };
+
+      await PlatformSubscription.replaceCurrentSubscription(
+        collective,
+        new Date(Date.UTC(2016, 0, 2, 22, 3)),
+        newPlan,
+        admin,
+      );
+
+      // Check that activity was created
+      const activity = await Activity.findOne({
+        where: {
+          CollectiveId: collective.id,
+          type: activities.PLATFORM_SUBSCRIPTION_UPDATED,
+        },
+        order: [['createdAt', 'DESC']], // Get the most recent activity
+      });
+
+      expect(activity).to.not.be.null;
+      expect(activity.data).to.have.property('previousPlan');
+      expect(activity.data).to.have.property('newPlan');
+      expect(activity.data.previousPlan).to.not.be.null;
+      expect(activity.data.previousPlan.title).to.equal('Initial Plan');
+      expect(activity.data.previousPlan.id).to.equal('initial-1');
+      expect(activity.data.newPlan.title).to.equal('New Plan');
+      expect(activity.data.newPlan.id).to.equal('new-5');
+    });
+
+    describe('feature changes side-effects', () => {
+      describe('Tax forms', () => {
+        it('removes RequiredLegalDocument when removing TAX_FORMS feature', async () => {
+          const admin = await fakeUser();
+          const host = await fakeActiveHost({ admin });
+          const oldSubscription = await PlatformSubscription.createSubscription(
+            host,
+            new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+            { title: 'A plan', features: { [FEATURE.TAX_FORMS]: true } },
+            admin,
+          );
+
+          await fakeRequiredLegalDocument({ HostCollectiveId: host.id });
+
+          const newSubscription = await PlatformSubscription.replaceCurrentSubscription(
+            host,
+            new Date(),
+            { title: 'A new plan', features: { [FEATURE.TAX_FORMS]: false } },
+            admin,
+          );
+
+          const updatedLegalDocument = await RequiredLegalDocument.findOne({
+            where: { HostCollectiveId: host.id },
+            paranoid: false,
+          });
+
+          expect(updatedLegalDocument).to.exist;
+          expect(updatedLegalDocument.deletedAt).to.not.be.null;
+
+          await oldSubscription.reload();
+          expect(oldSubscription.featureProvisioningStatus).to.equal('DEPROVISIONED');
+          expect(newSubscription.featureProvisioningStatus).to.equal('PROVISIONED');
+        });
+
+        it('keeps the RequiredLegalDocument when there is no change to the feature flag', async () => {
+          const admin = await fakeUser();
+          const host = await fakeActiveHost({ admin });
+          const oldSubscription = await PlatformSubscription.createSubscription(
+            host,
+            new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+            { title: 'A plan', features: { [FEATURE.TAX_FORMS]: true } },
+            admin,
+          );
+
+          const requiredLegalDoc = await fakeRequiredLegalDocument({ HostCollectiveId: host.id });
+
+          const newSubscription = await PlatformSubscription.replaceCurrentSubscription(
+            host,
+            new Date(),
+            { title: 'A new plan', features: { [FEATURE.TAX_FORMS]: true } },
+            admin,
+          );
+
+          const updatedLegalDocument = await RequiredLegalDocument.findOne({
+            where: { HostCollectiveId: host.id },
+            paranoid: false,
+          });
+
+          expect(updatedLegalDocument).to.exist;
+          expect(updatedLegalDocument.id).to.equal(requiredLegalDoc.id);
+          expect(updatedLegalDocument.deletedAt).to.be.null;
+
+          await oldSubscription.reload();
+          expect(oldSubscription.featureProvisioningStatus).to.equal('DEPROVISIONED');
+          expect(newSubscription.featureProvisioningStatus).to.equal('PROVISIONED');
+        });
+      });
+
+      describe('Off-platform transactions', () => {
+        let admin, host, connectedAccount, transactionsImport, row;
+
+        describe('Plaid', () => {
+          let stubPlaidAPI: sinon.SinonStubbedInstance<PlaidApi>;
+
+          beforeEach(async () => {
+            stubPlaidAPI = sandbox.createStubInstance(PlaidApi);
+            sandbox.stub(PlaidClient, 'getPlaidClient').returns(stubPlaidAPI);
+
+            admin = await fakeUser();
+            host = await fakeActiveHost({ admin });
+            connectedAccount = await fakeConnectedAccount({ CollectiveId: host.id, service: Service.PLAID });
+            transactionsImport = await fakeTransactionsImport({
+              CollectiveId: host.id,
+              ConnectedAccountId: connectedAccount.id,
+            });
+            row = await fakeTransactionsImportRow({ TransactionsImportId: transactionsImport.id });
+            await PlatformSubscription.createSubscription(
+              host,
+              new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+              { title: 'A plan', features: { [FEATURE.OFF_PLATFORM_TRANSACTIONS]: true } },
+              admin,
+            );
+          });
+
+          it('removes the connected account and archives the import when removing OFF_PLATFORM_TRANSACTIONS feature', async () => {
+            await PlatformSubscription.replaceCurrentSubscription(
+              host,
+              new Date(),
+              { title: 'A new plan', features: { [FEATURE.OFF_PLATFORM_TRANSACTIONS]: false } },
+              admin,
+            );
+
+            await connectedAccount.reload({ paranoid: false });
+            expect(connectedAccount.deletedAt).to.not.be.null;
+
+            await row.reload({ paranoid: false });
+            expect(row.deletedAt).to.be.null; // Rows should be preserved
+
+            expect(stubPlaidAPI.itemRemove).to.have.been.calledOnce;
+            expect(stubPlaidAPI.itemRemove).to.have.been.calledWith({
+              /* eslint-disable camelcase */
+              access_token: connectedAccount.token,
+              /* eslint-enable camelcase */
+            });
+          });
+
+          it('keeps the connected account and import when there is no change to the feature flag', async () => {
+            await PlatformSubscription.replaceCurrentSubscription(
+              host,
+              new Date(),
+              { title: 'A new plan', features: { [FEATURE.OFF_PLATFORM_TRANSACTIONS]: true } },
+              admin,
+            );
+
+            await connectedAccount.reload({ paranoid: false });
+            expect(connectedAccount.deletedAt).to.be.null;
+
+            await row.reload({ paranoid: false });
+            expect(row.deletedAt).to.be.null; // Rows should be preserved
+
+            expect(stubPlaidAPI.itemRemove).to.not.have.been.called;
+          });
+        });
+
+        describe('GoCardless', () => {
+          beforeEach(async () => {
+            admin = await fakeUser();
+            host = await fakeActiveHost({ admin });
+            connectedAccount = await fakeConnectedAccount({ CollectiveId: host.id, service: Service.GOCARDLESS });
+            transactionsImport = await fakeTransactionsImport({
+              CollectiveId: host.id,
+              ConnectedAccountId: connectedAccount.id,
+            });
+            row = await fakeTransactionsImportRow({ TransactionsImportId: transactionsImport.id });
+            await PlatformSubscription.createSubscription(
+              host,
+              new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+              { title: 'A plan', features: { [FEATURE.OFF_PLATFORM_TRANSACTIONS]: true } },
+              admin,
+            );
+          });
+
+          it('removes the connected account and archives the import when removing OFF_PLATFORM_TRANSACTIONS feature', async () => {
+            const stubDisconnectGoCardlessAccount = sandbox
+              .stub(GoCardlessConnect, 'disconnectGoCardlessAccount')
+              .resolves();
+            await PlatformSubscription.replaceCurrentSubscription(
+              host,
+              new Date(),
+              { title: 'A new plan', features: { [FEATURE.OFF_PLATFORM_TRANSACTIONS]: false } },
+              admin,
+            );
+
+            await connectedAccount.reload({ paranoid: false });
+            expect(connectedAccount.deletedAt).to.not.be.null;
+
+            await row.reload({ paranoid: false });
+            expect(row.deletedAt).to.be.null; // Rows should be preserved
+
+            expect(stubDisconnectGoCardlessAccount).to.have.been.calledOnce;
+            expect(stubDisconnectGoCardlessAccount.firstCall.args[0]).to.containSubset({
+              id: connectedAccount.id,
+            });
+          });
+
+          it('keeps the connected account and import when there is no change to the feature flag', async () => {
+            const stubDisconnectGoCardlessAccount = sandbox
+              .stub(GoCardlessConnect, 'disconnectGoCardlessAccount')
+              .resolves();
+
+            await PlatformSubscription.replaceCurrentSubscription(
+              host,
+              new Date(),
+              { title: 'A new plan', features: { [FEATURE.OFF_PLATFORM_TRANSACTIONS]: true } },
+              admin,
+            );
+
+            expect(stubDisconnectGoCardlessAccount).to.not.have.been.called;
+
+            await connectedAccount.reload({ paranoid: false });
+            expect(connectedAccount.deletedAt).to.be.null;
+          });
+
+          it('continues if the disconnect fails', async () => {
+            const stubDisconnectGoCardlessAccount = sandbox
+              .stub(GoCardlessConnect, 'disconnectGoCardlessAccount')
+              .rejects(new Error('Failed to disconnect GoCardless account'));
+            const stubReportErrorToSentry = sandbox.stub(SentryLib, 'reportErrorToSentry');
+
+            await PlatformSubscription.replaceCurrentSubscription(
+              host,
+              new Date(),
+              { title: 'A new plan', features: { [FEATURE.OFF_PLATFORM_TRANSACTIONS]: false } },
+              admin,
+            );
+
+            // Account not deleted if the disconnect fails
+            await connectedAccount.reload({ paranoid: false });
+            expect(connectedAccount.deletedAt).to.be.null;
+
+            await transactionsImport.reload({ paranoid: false });
+            expect(transactionsImport.ConnectedAccountId).to.be.null;
+
+            await row.reload({ paranoid: false });
+            expect(row.deletedAt).to.be.null; // Rows should be preserved
+
+            expect(stubDisconnectGoCardlessAccount).to.have.been.calledOnce;
+            expect(stubDisconnectGoCardlessAccount.firstCall.args[0]).to.containSubset({
+              id: connectedAccount.id,
+            });
+
+            expect(stubReportErrorToSentry).to.have.been.calledOnce;
+            expect(stubReportErrorToSentry.firstCall.args[0].message).to.equal(
+              'Failed to disconnect transactions imports while provisioning feature changes',
+            );
+            expect(stubReportErrorToSentry.firstCall.args[1].extra.failures[0].import.id).to.equal(
+              transactionsImport.id,
+            );
+            expect(stubReportErrorToSentry.firstCall.args[1].extra.failures[0].error.message).to.equal(
+              'Failed to disconnect GoCardless account',
+            );
+          });
+        });
+      });
+
+      describe('Host fee', () => {
+        it('removes the host fee when removing CHARGE_HOSTING_FEES feature', async () => {
+          const admin = await fakeUser();
+          const host = await fakeActiveHost({ admin, hostFeePercent: 10 });
+          const regularCollective = await fakeCollective({
+            HostCollectiveId: host.id,
+            hostFeePercent: 10,
+            approvedAt: new Date(),
+          });
+          const collectiveWithCustomHostFee = await fakeCollective({
+            HostCollectiveId: host.id,
+            hostFeePercent: 5,
+            approvedAt: new Date(),
+            data: { useCustomHostFee: true },
+          });
+          await PlatformSubscription.createSubscription(
+            host,
+            new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+            { title: 'A plan', features: { [FEATURE.CHARGE_HOSTING_FEES]: true } },
+            admin,
+          );
+
+          await expect(regularCollective.reload()).to.eventually.have.property('hostFeePercent', 10);
+          await expect(collectiveWithCustomHostFee.reload()).to.eventually.have.property('hostFeePercent', 5);
+
+          await PlatformSubscription.replaceCurrentSubscription(
+            host,
+            new Date(),
+            { title: 'A new plan', features: { [FEATURE.CHARGE_HOSTING_FEES]: false } },
+            admin,
+          );
+
+          await expect(regularCollective.reload()).to.eventually.have.property('hostFeePercent', 0);
+          await expect(collectiveWithCustomHostFee.reload()).to.eventually.have.property('hostFeePercent', 0);
+        });
+
+        it('is NOT removed when upgrading to a plan that also has the feature', async () => {
+          const admin = await fakeUser();
+          const host = await fakeActiveHost({ admin, hostFeePercent: 10 });
+          const regularCollective = await fakeCollective({
+            HostCollectiveId: host.id,
+            hostFeePercent: 10,
+            approvedAt: new Date(),
+          });
+          const collectiveWithCustomHostFee = await fakeCollective({
+            HostCollectiveId: host.id,
+            hostFeePercent: 5,
+            approvedAt: new Date(),
+            data: { useCustomHostFee: true },
+          });
+          await PlatformSubscription.createSubscription(
+            host,
+            new Date(Date.UTC(2016, 0, 1, 22, 1, 22, 1)),
+            { title: 'A plan', features: { [FEATURE.CHARGE_HOSTING_FEES]: true } },
+            admin,
+          );
+
+          await expect(regularCollective.reload()).to.eventually.have.property('hostFeePercent', 10);
+          await expect(collectiveWithCustomHostFee.reload()).to.eventually.have.property('hostFeePercent', 5);
+
+          await PlatformSubscription.replaceCurrentSubscription(
+            host,
+            new Date(),
+            { title: 'A new plan', features: { [FEATURE.CHARGE_HOSTING_FEES]: true } },
+            admin,
+          );
+
+          await expect(regularCollective.reload()).to.eventually.have.property('hostFeePercent', 10);
+          await expect(collectiveWithCustomHostFee.reload()).to.eventually.have.property('hostFeePercent', 5);
+        });
+      });
+    });
+  });
+
+  describe('calculateUtilization', () => {
+    beforeEach(async () => {
+      await resetTestDB();
+    });
+
+    it('returns utilization for period', async () => {
+      const hostAdmin = await fakeUser();
+      const host = await fakeActiveHost({ admin: hostAdmin });
+      const col = await fakeCollective({
+        HostCollectiveId: host.id,
+      });
+
+      const colWithEvent = await fakeCollective({
+        HostCollectiveId: host.id,
+      });
+
+      const event = await fakeEvent({
+        ParentCollectiveId: colWithEvent.id,
+      });
+
+      const colWithProject = await fakeCollective({
+        HostCollectiveId: host.id,
+      });
+
+      const project = await fakeProject({
+        ParentCollectiveId: colWithProject.id,
+      });
+
+      const otherCol = await fakeCollective({
+        HostCollectiveId: host.id,
+      });
+
+      const colActiveOutsidePeriod = await fakeCollective({
+        HostCollectiveId: host.id,
+      });
+
+      const colActiveOutsidePeriod2 = await fakeCollective({
+        HostCollectiveId: host.id,
+      });
+
+      await fakeTransaction({
+        HostCollectiveId: host.id,
+        CollectiveId: colActiveOutsidePeriod.id,
+        createdAt: new Date(Date.UTC(2026, 0, 2)),
+      });
+
+      await fakeExpensePaidWithActivity({
+        HostCollectiveId: host.id,
+        CollectiveId: colActiveOutsidePeriod2.id,
+        createdAt: new Date(Date.UTC(2026, 0, 2)),
+        status: ExpenseStatuses.PAID,
+      });
+
+      await fakeCollective({
+        HostCollectiveId: host.id,
+      });
+
+      await PlatformSubscription.createSubscription(
+        host,
+        new Date(Date.UTC(2016, 0, 1)),
+        {
+          title: 'A plan',
+        },
+        hostAdmin,
+      );
+
+      const billingPeriod: BillingPeriod = {
+        year: 2016,
+        month: BillingMonth.JANUARY,
+      };
+      await expect(PlatformSubscription.calculateUtilization(host.id, billingPeriod)).to.eventually.eql({
+        [UtilizationType.ACTIVE_COLLECTIVES]: 0,
+        [UtilizationType.EXPENSES_PAID]: 0,
+      });
+
+      await fakeTransaction({
+        HostCollectiveId: host.id,
+        CollectiveId: colWithEvent.id,
+        createdAt: new Date(Date.UTC(2016, 0, 2)),
+      });
+
+      await fakeTransaction({
+        HostCollectiveId: host.id,
+        CollectiveId: event.id,
+        createdAt: new Date(Date.UTC(2016, 0, 2)),
+      });
+
+      await fakeTransaction({
+        HostCollectiveId: host.id,
+        CollectiveId: colWithProject.id,
+        createdAt: new Date(Date.UTC(2016, 0, 2)),
+      });
+
+      await fakeTransaction({
+        HostCollectiveId: host.id,
+        CollectiveId: project.id,
+        createdAt: new Date(Date.UTC(2016, 0, 2)),
+      });
+
+      await fakeTransaction({
+        HostCollectiveId: host.id,
+        CollectiveId: col.id,
+        createdAt: new Date(Date.UTC(2016, 0, 2)),
+      });
+      await fakeTransaction({
+        HostCollectiveId: host.id,
+        CollectiveId: col.id,
+        createdAt: new Date(Date.UTC(2016, 0, 20)),
+      });
+
+      await expect(PlatformSubscription.calculateUtilization(host.id, billingPeriod)).to.eventually.eql({
+        [UtilizationType.ACTIVE_COLLECTIVES]: 3,
+        [UtilizationType.EXPENSES_PAID]: 0,
+      });
+
+      await fakeExpensePaidWithActivity({
+        HostCollectiveId: host.id,
+        CollectiveId: otherCol.id,
+        createdAt: new Date(Date.UTC(2016, 0, 20)),
+        status: ExpenseStatuses.PAID,
+      });
+
+      await expect(PlatformSubscription.calculateUtilization(host.id, billingPeriod)).to.eventually.eql({
+        [UtilizationType.ACTIVE_COLLECTIVES]: 3,
+        [UtilizationType.EXPENSES_PAID]: 1,
+      });
+
+      await fakeExpensePaidWithActivity({
+        HostCollectiveId: host.id,
+        CollectiveId: col.id,
+        createdAt: new Date(Date.UTC(2016, 0, 30)),
+        status: ExpenseStatuses.PAID,
+      });
+
+      await fakeTransaction({
+        HostCollectiveId: host.id,
+        CollectiveId: otherCol.id,
+        createdAt: new Date(Date.UTC(2016, 0, 20)),
+      });
+
+      await fakeExpensePaidWithActivity({
+        HostCollectiveId: host.id,
+        CollectiveId: otherCol.id,
+        createdAt: new Date(Date.UTC(2016, 0, 30)),
+        status: ExpenseStatuses.PAID,
+      });
+
+      // will not count
+      const rePaidInThisBillingPeriod = await fakeExpense({
+        HostCollectiveId: host.id,
+        CollectiveId: otherCol.id,
+        createdAt: new Date(Date.UTC(2015, 0, 30)),
+      });
+
+      await fakeActivity({
+        type: activities.COLLECTIVE_EXPENSE_PAID,
+        HostCollectiveId: rePaidInThisBillingPeriod.HostCollectiveId,
+        CollectiveId: rePaidInThisBillingPeriod.CollectiveId,
+        ExpenseId: rePaidInThisBillingPeriod.id,
+        createdAt: new Date(Date.UTC(2015, 0, 30)),
+      });
+
+      // paid again, will not count
+      await fakeActivity({
+        type: activities.COLLECTIVE_EXPENSE_PAID,
+        HostCollectiveId: rePaidInThisBillingPeriod.HostCollectiveId,
+        CollectiveId: rePaidInThisBillingPeriod.CollectiveId,
+        ExpenseId: rePaidInThisBillingPeriod.id,
+        createdAt: new Date(Date.UTC(2016, 0, 30)),
+      });
+
+      await expect(PlatformSubscription.calculateUtilization(host.id, billingPeriod)).to.eventually.eql({
+        [UtilizationType.ACTIVE_COLLECTIVES]: 4,
+        [UtilizationType.EXPENSES_PAID]: 3,
+      });
+
+      // Platform settlements and platform billing expenses must not count towards billing utilization
+      await fakeExpensePaidWithActivity({
+        HostCollectiveId: host.id,
+        CollectiveId: otherCol.id,
+        createdAt: new Date(Date.UTC(2016, 0, 30)),
+        status: ExpenseStatuses.PAID,
+        type: ExpenseType.SETTLEMENT,
+      });
+
+      await fakeExpensePaidWithActivity({
+        HostCollectiveId: host.id,
+        CollectiveId: otherCol.id,
+        createdAt: new Date(Date.UTC(2016, 0, 30)),
+        status: ExpenseStatuses.PAID,
+        type: ExpenseType.PLATFORM_BILLING,
+      });
+
+      await expect(PlatformSubscription.calculateUtilization(host.id, billingPeriod)).to.eventually.eql({
+        [UtilizationType.ACTIVE_COLLECTIVES]: 4,
+        [UtilizationType.EXPENSES_PAID]: 3,
+      });
+    });
+  });
+
+  describe('consolidateSubscriptionsForBillingPeriod', () => {
+    const billingPeriod: BillingPeriod = { year: 2016, month: BillingMonth.JANUARY };
+    const discoverPlan = PlatformSubscriptionTiers.find(t => t.id === 'discover-1') as PlatformSubscriptionPlan;
+    const basicPlan = PlatformSubscriptionTiers.find(t => t.id === 'basic-5') as PlatformSubscriptionPlan;
+    const proPlan = PlatformSubscriptionTiers.find(t => t.id === 'pro-20') as PlatformSubscriptionPlan;
+
+    /** Build an in-memory PlatformSubscription without touching the DB */
+    const makeSub = (plan: Partial<PlatformSubscriptionPlan>, start: Date, end?: Date): PlatformSubscription =>
+      PlatformSubscription.build({
+        CollectiveId: 1,
+        plan,
+        period: [
+          { value: start, inclusive: true },
+          end ? { value: end, inclusive: false } : { value: Infinity, inclusive: true },
+        ],
+      } as Parameters<typeof PlatformSubscription.build>[0]);
+
+    it('Basic -> Discover -> Pro produces 2 billing entries: Discover (absorbing Basic) then Pro', () => {
+      // Basic→Discover is a downgrade: Discover absorbs Basic.
+      // Discover→Pro is an upgrade: Pro gets its own entry.
+      const basicSub = makeSub(basicPlan, new Date(Date.UTC(2016, 0, 1)), new Date(Date.UTC(2016, 0, 8)));
+      const discoverSub = makeSub(discoverPlan, new Date(Date.UTC(2016, 0, 8)), new Date(Date.UTC(2016, 0, 15)));
+      const proSub = makeSub(proPlan, new Date(Date.UTC(2016, 0, 15)));
+
+      // subscriptions must be sorted newest first (as returned by getSubscriptionsInBillingPeriod)
+      const result = consolidateSubscriptionsForBillingPeriod([proSub, discoverSub, basicSub], billingPeriod);
+
+      expect(result).to.have.length(2);
+      expect(result[0].sub).to.equal(proSub);
+      expect(result[0].effectiveStart).to.deep.equal(new Date(Date.UTC(2016, 0, 15)));
+      expect(result[1].sub).to.equal(discoverSub);
+      // Discover's effective start is extended back to Jan 1 to cover the absorbed Basic period
+      expect(result[1].effectiveStart).to.deep.equal(new Date(Date.UTC(2016, 0, 1)));
+    });
+
+    it('Basic -> Pro -> Discover produces 1 billing entry: Discover absorbs Pro and Basic', () => {
+      // Pro→Discover is a downgrade: Discover becomes the running minimum.
+      // Basic is above Discover, so it is also absorbed even though Basic→Pro was an upgrade.
+      const basicSub = makeSub(basicPlan, new Date(Date.UTC(2016, 0, 1)), new Date(Date.UTC(2016, 0, 8)));
+      const proSub = makeSub(proPlan, new Date(Date.UTC(2016, 0, 8)), new Date(Date.UTC(2016, 0, 15)));
+      const discoverSub = makeSub(discoverPlan, new Date(Date.UTC(2016, 0, 15)));
+
+      const result = consolidateSubscriptionsForBillingPeriod([discoverSub, proSub, basicSub], billingPeriod);
+
+      expect(result).to.have.length(1);
+      expect(result[0].sub).to.equal(discoverSub);
+      expect(result[0].effectiveStart).to.deep.equal(new Date(Date.UTC(2016, 0, 1)));
+    });
+
+    it('Basic -> Basic -> Discover produces 1 billing entry: Discover absorbs both Basic subscriptions', () => {
+      const basic1Sub = makeSub(basicPlan, new Date(Date.UTC(2016, 0, 1)), new Date(Date.UTC(2016, 0, 8)));
+      const basic2Sub = makeSub(basicPlan, new Date(Date.UTC(2016, 0, 8)), new Date(Date.UTC(2016, 0, 15)));
+      const discoverSub = makeSub(discoverPlan, new Date(Date.UTC(2016, 0, 15)));
+
+      const result = consolidateSubscriptionsForBillingPeriod([discoverSub, basic2Sub, basic1Sub], billingPeriod);
+
+      expect(result).to.have.length(1);
+      expect(result[0].sub).to.equal(discoverSub);
+      expect(result[0].effectiveStart).to.deep.equal(new Date(Date.UTC(2016, 0, 1)));
+    });
+
+    it('Basic -> Discover -> Basic -> Pro -> Discover produces 1 billing entry: final Discover absorbs everything', () => {
+      // The final Discover becomes the running minimum and absorbs all higher-tier segments,
+      // including the intermediate Discover (same tier) and everything before it.
+      const basic1Sub = makeSub(basicPlan, new Date(Date.UTC(2016, 0, 1)), new Date(Date.UTC(2016, 0, 7)));
+      const discover1Sub = makeSub(discoverPlan, new Date(Date.UTC(2016, 0, 7)), new Date(Date.UTC(2016, 0, 13)));
+      const basic2Sub = makeSub(basicPlan, new Date(Date.UTC(2016, 0, 13)), new Date(Date.UTC(2016, 0, 19)));
+      const proSub = makeSub(proPlan, new Date(Date.UTC(2016, 0, 19)), new Date(Date.UTC(2016, 0, 25)));
+      const discover2Sub = makeSub(discoverPlan, new Date(Date.UTC(2016, 0, 25)));
+
+      const result = consolidateSubscriptionsForBillingPeriod(
+        [discover2Sub, proSub, basic2Sub, discover1Sub, basic1Sub],
+        billingPeriod,
+      );
+
+      expect(result).to.have.length(1);
+      expect(result[0].sub).to.equal(discover2Sub);
+      expect(result[0].effectiveStart).to.deep.equal(new Date(Date.UTC(2016, 0, 1)));
+    });
+  });
+
+  describe('billing', () => {
+    beforeEach(async () => {
+      await resetTestDB();
+    });
+
+    it('returns active subscriptions during billing period', async () => {
+      const billingPeriod = {
+        year: 2016,
+        month: BillingMonth.JANUARY,
+      };
+
+      const admin = await fakeUser();
+      const collective1 = await fakeCollective({ admin }); // two subscriptions were active in billing period
+      const collective1Sub1 = await PlatformSubscription.createSubscription(
+        collective1,
+        new Date(Date.UTC(2016, 0, 1)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+      const collective1Sub2 = await PlatformSubscription.replaceCurrentSubscription(
+        collective1,
+        new Date(Date.UTC(2016, 0, 5)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+
+      const collective1Subs = await PlatformSubscription.getSubscriptionsInBillingPeriod(collective1.id, billingPeriod);
+      expect(collective1Subs[0].id).to.eql(collective1Sub2.id);
+      expect(collective1Subs[1].id).to.eql(collective1Sub1.id);
+
+      const collective2 = await fakeCollective({ admin }); // no active subscription in billing period
+      await expect(
+        PlatformSubscription.getSubscriptionsInBillingPeriod(collective2.id, billingPeriod),
+      ).to.eventually.have.length(0);
+
+      const collective3 = await fakeCollective({ admin }); // one active subscription in billing period
+      const collective3Sub1 = await PlatformSubscription.createSubscription(
+        collective3,
+        new Date(Date.UTC(2016, 0, 1)),
+        {
+          title: 'A plan',
+        },
+        admin,
+      );
+      const collective3Subs = await PlatformSubscription.getSubscriptionsInBillingPeriod(collective3.id, billingPeriod);
+      expect(collective3Subs[0].id).to.eql(collective3Sub1.id);
+    });
+
+    it('calculates utilization and charges for billing period with two subs', async () => {
+      const billingPeriod = {
+        year: 2016,
+        month: BillingMonth.JANUARY,
+      };
+
+      const admin = await fakeUser();
+      const host = await fakeActiveHost({ admin });
+      const sub1 = await PlatformSubscription.createSubscription(
+        host,
+        new Date(Date.UTC(2016, 0, 1)),
+        PlatformSubscriptionTiers.find(plan => plan.id === 'basic-5'),
+        admin,
+      );
+
+      // create 10 active collectives
+      for (let i = 0; i < 10; i++) {
+        const col = await fakeCollective({ HostCollectiveId: host.id });
+        await fakeTransaction({
+          HostCollectiveId: host.id,
+          CollectiveId: col.id,
+          createdAt: new Date(Date.UTC(2016, 0, 20)),
+        });
+      }
+
+      const col = await fakeCollective({ HostCollectiveId: host.id });
+      // 60 paid expenses
+      for (let i = 0; i < 60; i++) {
+        await fakeExpensePaidWithActivity({
+          HostCollectiveId: host.id,
+          CollectiveId: col.id,
+          createdAt: new Date(Date.UTC(2016, 0, 2)),
+          status: ExpenseStatuses.PAID,
+        });
+      }
+
+      let billing = await PlatformSubscription.calculateBilling(host.id, billingPeriod);
+      expect(billing).to.containSubset({
+        additional: {
+          amounts: {
+            activeCollectives: 7500,
+            expensesPaid: 1500,
+          },
+          utilization: {
+            activeCollectives: 5,
+            expensesPaid: 10,
+          },
+          total: 9000,
+        },
+        utilization: {
+          activeCollectives: 10,
+          expensesPaid: 60,
+        },
+        base: {
+          total: 6000,
+          subscriptions: [{ amount: 6000 }],
+        },
+        totalAmount: 15000,
+      });
+
+      const sub2 = await PlatformSubscription.replaceCurrentSubscription(
+        host,
+        new Date(Date.UTC(2016, 0, 15)),
+        PlatformSubscriptionTiers.find(plan => plan.id === 'pro-20'),
+        admin,
+      );
+      await sub1.reload();
+      const [, sub2BillingEnd] = sub2.overlapWith(billingPeriod);
+
+      billing = await PlatformSubscription.calculateBilling(host.id, billingPeriod);
+      expect(billing).to.containSubset({
+        additional: {
+          amounts: {
+            activeCollectives: 0,
+            expensesPaid: 0,
+          },
+          utilization: {
+            activeCollectives: 0,
+            expensesPaid: 0,
+          },
+          total: 0,
+        },
+        utilization: {
+          activeCollectives: 10,
+          expensesPaid: 60,
+        },
+        base: {
+          total: 20258,
+          subscriptions: [
+            {
+              title: 'Pro 20',
+              amount: 17548,
+              startDate: sub2.startDate,
+              endDate: sub2BillingEnd,
+            },
+            {
+              title: 'Basic 5',
+              amount: 2710,
+              startDate: sub1.startDate,
+              endDate: sub1.endDate,
+            },
+          ],
+        },
+        totalAmount: 20258,
+      });
+    });
+
+    it('charges only the lowest monthly base price when downgrading in the billing period (no pro-rata for higher tiers)', async () => {
+      const billingPeriod = {
+        year: 2016,
+        month: BillingMonth.JANUARY,
+      };
+
+      const admin = await fakeUser();
+      const host = await fakeActiveHost({ admin });
+      const proPlan = PlatformSubscriptionTiers.find(plan => plan.id === 'pro-20');
+      const basicPlan = PlatformSubscriptionTiers.find(plan => plan.id === 'basic-5');
+
+      const proSub = await PlatformSubscription.createSubscription(
+        host,
+        new Date(Date.UTC(2016, 0, 1)),
+        proPlan,
+        admin,
+      );
+
+      await PlatformSubscription.replaceCurrentSubscription(host, new Date(Date.UTC(2016, 0, 16)), basicPlan, admin);
+      await proSub.reload();
+
+      const billing = await PlatformSubscription.calculateBilling(host.id, billingPeriod);
+      // Basic absorbs the Pro period entirely: only one billing entry at the Basic rate for the whole month
+      expect(billing.base.total).to.equal(basicPlan.pricing.pricePerMonth);
+      expect(billing.base.subscriptions).to.have.length(1);
+      expect(billing.base.subscriptions[0].title).to.equal(basicPlan.title);
+      expect(billing.base.subscriptions[0].amount).to.equal(basicPlan.pricing.pricePerMonth);
+    });
+
+    it('calculates utilization and charges for billing period with partial sub', async () => {
+      const billingPeriod = {
+        year: 2016,
+        month: BillingMonth.JANUARY,
+      };
+
+      const hostAdmin = await fakeUser();
+      const host = await fakeActiveHost({ admin: hostAdmin });
+      await PlatformSubscription.createSubscription(
+        host,
+        new Date(Date.UTC(2016, 0, 15)),
+        PlatformSubscriptionTiers.find(plan => plan.id === 'basic-5'),
+        hostAdmin,
+      );
+
+      // create 10 active collectives
+      for (let i = 0; i < 10; i++) {
+        const col = await fakeCollective({ HostCollectiveId: host.id });
+        await fakeTransaction({
+          HostCollectiveId: host.id,
+          CollectiveId: col.id,
+          createdAt: new Date(Date.UTC(2016, 0, 20)),
+        });
+      }
+
+      const col = await fakeCollective({ HostCollectiveId: host.id });
+      // 60 paid expenses
+      for (let i = 0; i < 60; i++) {
+        await fakeExpensePaidWithActivity({
+          HostCollectiveId: host.id,
+          CollectiveId: col.id,
+          createdAt: new Date(Date.UTC(2016, 0, 2)),
+          status: ExpenseStatuses.PAID,
+        });
+      }
+
+      const billing = await PlatformSubscription.calculateBilling(host.id, billingPeriod);
+      expect(billing).to.containSubset({
+        additional: {
+          amounts: {
+            activeCollectives: 7500,
+            expensesPaid: 1500,
+          },
+          utilization: {
+            activeCollectives: 5,
+            expensesPaid: 10,
+          },
+          total: 9000,
+        },
+        utilization: {
+          activeCollectives: 10,
+          expensesPaid: 60,
+        },
+        base: {
+          total: 3290,
+          subscriptions: [{ amount: 3290 }],
+        },
+        totalAmount: 12290,
+      });
+    });
+
+    it('calculates utilization and charges for billing period with ended sub', async () => {
+      const billingPeriod = {
+        year: 2016,
+        month: BillingMonth.JANUARY,
+      };
+
+      const hostAdmin = await fakeUser();
+      const host = await fakeActiveHost({ admin: hostAdmin });
+      const sub = await PlatformSubscription.createSubscription(
+        host,
+        new Date(Date.UTC(2016, 0, 1)),
+        PlatformSubscriptionTiers.find(plan => plan.id === 'basic-5'),
+        hostAdmin,
+      );
+
+      // create 10 active collectives
+      for (let i = 0; i < 10; i++) {
+        const col = await fakeCollective({ HostCollectiveId: host.id });
+        await fakeTransaction({
+          HostCollectiveId: host.id,
+          CollectiveId: col.id,
+          createdAt: new Date(Date.UTC(2016, 0, 20)),
+        });
+      }
+
+      const col = await fakeCollective({ HostCollectiveId: host.id });
+      // 60 paid expenses
+      for (let i = 0; i < 60; i++) {
+        await fakeExpensePaidWithActivity({
+          HostCollectiveId: host.id,
+          CollectiveId: col.id,
+          createdAt: new Date(Date.UTC(2016, 0, 2)),
+          status: ExpenseStatuses.PAID,
+        });
+      }
+
+      await sub.update({
+        period: [
+          sub.start,
+          {
+            value: new Date(Date.UTC(2016, 0, 15)),
+            inclusive: false,
+          },
+        ],
+      });
+
+      const billing = await PlatformSubscription.calculateBilling(host.id, billingPeriod);
+      expect(billing).to.containSubset({
+        additional: {
+          amounts: {
+            activeCollectives: 7500,
+            expensesPaid: 1500,
+          },
+          utilization: {
+            activeCollectives: 5,
+            expensesPaid: 10,
+          },
+          total: 9000,
+        },
+        utilization: {
+          activeCollectives: 10,
+          expensesPaid: 60,
+        },
+        base: {
+          total: 2710,
+          subscriptions: [{ amount: 2710 }],
+        },
+        totalAmount: 11710,
+      });
+    });
+  });
+});

@@ -1,0 +1,81 @@
+import { GraphQLBoolean, GraphQLInputObjectType, GraphQLInt, GraphQLString } from 'graphql';
+
+import { EntityShortIdPrefix, isEntityPublicId } from '../../../lib/permalink/entity-map';
+import models from '../../../models';
+import Tier from '../../../models/Tier';
+import { NotFound } from '../../errors';
+import { Loaders } from '../../loaders';
+import { idDecode, IDENTIFIER_TYPES } from '../identifiers';
+
+export const GraphQLTierReferenceInput = new GraphQLInputObjectType({
+  name: 'TierReferenceInput',
+  fields: () => ({
+    id: {
+      type: GraphQLString,
+      description: `The id assigned to the Tier (ie: ${EntityShortIdPrefix.Tier}_xxxxxxxx)`,
+    },
+    legacyId: {
+      type: GraphQLInt,
+      description: 'The DB id assigned to the Tier',
+      deprecationReason: '2026-02-25: use id',
+    },
+    isCustom: {
+      type: GraphQLBoolean,
+      description: 'Pass this flag to reference the custom tier (/donate)',
+    },
+  }),
+});
+
+/**
+ * Retrieves a tier
+ *
+ * @param {string|number} input - id of the tier
+ */
+export const fetchTierWithReference = async (
+  input,
+  { loaders = null, throwIfMissing = false } = {},
+): Promise<Tier | null> => {
+  const loadTier = id => (loaders ? loaders.Tier.byId.load(id) : Tier.findByPk(id));
+  let tier;
+  if (isEntityPublicId(input.id, EntityShortIdPrefix.Tier)) {
+    tier = await (loaders ? loaders.Tier.byPublicId.load(input.id) : Tier.findOne({ where: { publicId: input.id } }));
+  } else if (input.id) {
+    const id = idDecode(input.id, IDENTIFIER_TYPES.TIER);
+    tier = await loadTier(id);
+  } else if (input.legacyId) {
+    tier = await loadTier(input.legacyId);
+  } else {
+    throw new Error('Please provide an id');
+  }
+  if (!tier && throwIfMissing) {
+    throw new NotFound(`Tier Not Found`);
+  }
+  return tier;
+};
+
+export const getDatabaseIdFromTierReference = async (
+  input: {
+    id?: string;
+    legacyId?: number;
+  },
+  { loaders = null }: { loaders?: Loaders } = {},
+): Promise<number | null> => {
+  if (isEntityPublicId(input.id, EntityShortIdPrefix.Tier)) {
+    return (
+      loaders
+        ? loaders.Tier.byPublicId.load(input.id)
+        : models.Tier.findOne({ where: { publicId: input.id }, attributes: ['id'] })
+    ).then(tier => {
+      if (!tier) {
+        throw new NotFound(`Tier with public id ${input.id} not found`);
+      }
+      return tier.id;
+    });
+  } else if (input.id) {
+    return idDecode(input.id, IDENTIFIER_TYPES.TIER);
+  } else if (input.legacyId) {
+    return input.legacyId;
+  } else {
+    throw new Error(`Please provide an id or a legacyId (got ${JSON.stringify(input)})`);
+  }
+};

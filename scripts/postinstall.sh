@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+PG_HOST=${PG_HOST:-"localhost"}
+
+set -e
+
+if [ "$OC_ENV" = "ci" ]; then
+  echo "Skipping postinstall because OC_ENV is \"ci\""
+  exit $?; # exit with return code of previous command
+fi
+
+if [ "$SKIP_POSTINSTALL" = "1" ]; then
+  echo "Skipping postinstall because SKIP_POSTINSTALL is \"1\""
+  exit $?; # exit with return code of previous command
+fi
+
+# Only run migrations automatically on staging and production
+if [ "$SEQUELIZE_ENV" = "staging" ] || [ "$SEQUELIZE_ENV" = "production" ]; then
+  echo "- running db:migrate on $SEQUELIZE_ENV environment"
+  npm run db:migrate
+  exit $?; # exit with return code of previous command
+fi
+
+if command -v psql > /dev/null; then
+  echo "✓ PostgreSQL installed"
+else
+  echo "𐄂 psql command doesn't exist. Make sure you have PostgreSQL installed."
+  echo ""
+  echo "See: https://github.com/opencollective/opencollective-api/blob/main/docs/postgres.md"
+  echo ""
+  exit 1
+fi
+if psql -h $PG_HOST -U postgres -lqt | cut -d \| -f 1 | grep -qw opencollective_dvl; then
+  echo "✓ opencollective_dvl exists"
+  ./scripts/db_restore_extensions.sh -d opencollective_dvl -U opencollective -h $PG_HOST
+else
+  echo "- restoring opencollective_dvl";
+  npm run db:restore
+fi
+echo "- running migration if any"
+PG_DATABASE=opencollective_dvl npm run db:migrate
+
+UNAME=$(uname -a)
+if [[ $UNAME =~ "Darwin" && $UNAME =~ "arm64" ]]; then
+  echo "✓ Running on Apple Silicon (arm64), installing sharp for arm64"
+  npm install --os=darwin --cpu=arm64 --ignore-scripts --no-save sharp
+fi
+
+echo ""
+echo "You can now start the Open Collective API server by running:"
+echo "$> npm run dev"
+echo ""

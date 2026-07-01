@@ -1,0 +1,113 @@
+import config from 'config';
+
+import { VirtualCardLimitIntervals } from './virtual-cards';
+
+enum POLICIES {
+  // When enabled, the author (the user that submitted and not necessarily the benefactor) of an Expense, cannot Approve the same expense.
+  EXPENSE_AUTHOR_CANNOT_APPROVE = 'EXPENSE_AUTHOR_CANNOT_APPROVE',
+  // When enabled, restrict who can apply for fiscal host.
+  COLLECTIVE_MINIMUM_ADMINS = 'COLLECTIVE_MINIMUM_ADMINS',
+  // Specifies the maximum virtual card limit amount per interval
+  MAXIMUM_VIRTUAL_CARD_LIMIT_AMOUNT_FOR_INTERVAL = 'MAXIMUM_VIRTUAL_CARD_LIMIT_AMOUNT_FOR_INTERVAL',
+  // When enabled, all admins of the account will have to enable 2FA before they can perform any action.
+  REQUIRE_2FA_FOR_ADMINS = 'REQUIRE_2FA_FOR_ADMINS',
+  // When enabled, admins of the collective are allowed to refund expenses
+  COLLECTIVE_ADMINS_CAN_REFUND = 'COLLECTIVE_ADMINS_CAN_REFUND',
+  // Whether we expect expense submitters and collective admins to take part in the expense categorization process (for accounting)
+  EXPENSE_CATEGORIZATION = 'EXPENSE_CATEGORIZATION',
+  // @deprecated Use USE_VENDOR_POLICY instead.
+  EXPENSE_PUBLIC_VENDORS = 'EXPENSE_PUBLIC_VENDORS',
+  // Controls who can attribute financial activities (expenses, orders) to vendors.
+  // Per-vendor override: vendor.data.useVendorPolicy.
+  USE_VENDOR_POLICY = 'USE_VENDOR_POLICY',
+  // When enabled, admins of the collective are allowed to see the payout methods of expenses
+  COLLECTIVE_ADMINS_CAN_SEE_PAYOUT_METHODS = 'COLLECTIVE_ADMINS_CAN_SEE_PAYOUT_METHODS',
+  EXPENSE_POLICIES = 'EXPENSE_POLICIES',
+  /** Enforces contributor information requirements based on yearly contribution amount thresholds */
+  CONTRIBUTOR_INFO_THRESHOLDS = 'CONTRIBUTOR_INFO_THRESHOLDS',
+}
+
+export enum UseVendorPolicyValue {
+  HOST_ADMINS = 'HOST_ADMINS',
+  HOST_AND_COLLECTIVE_ADMINS = 'HOST_AND_COLLECTIVE_ADMINS',
+  ALL_SUBMITTERS = 'ALL_SUBMITTERS',
+}
+
+export type Policies = Partial<{
+  [POLICIES.EXPENSE_POLICIES]: {
+    invoicePolicy: string;
+    receiptPolicy: string;
+    titlePolicy: string;
+    grantPolicy: string;
+  };
+  [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: {
+    enabled: boolean;
+    amountInCents: number;
+    appliesToHostedCollectives: boolean;
+    appliesToSingleAdminCollectives: boolean;
+  };
+  [POLICIES.COLLECTIVE_MINIMUM_ADMINS]: Partial<{
+    numberOfAdmins: number;
+    applies: 'ALL_COLLECTIVES' | 'NEW_COLLECTIVES';
+    freeze: boolean;
+  }>;
+  [POLICIES.MAXIMUM_VIRTUAL_CARD_LIMIT_AMOUNT_FOR_INTERVAL]: Partial<{
+    [interval in VirtualCardLimitIntervals]: number;
+  }>;
+
+  [POLICIES.REQUIRE_2FA_FOR_ADMINS]: boolean;
+  [POLICIES.COLLECTIVE_ADMINS_CAN_REFUND]: boolean;
+  [POLICIES.EXPENSE_CATEGORIZATION]: {
+    requiredForExpenseSubmitters: boolean;
+    requiredForCollectiveAdmins: boolean;
+  };
+  [POLICIES.EXPENSE_PUBLIC_VENDORS]: boolean;
+  [POLICIES.USE_VENDOR_POLICY]: UseVendorPolicyValue;
+  [POLICIES.COLLECTIVE_ADMINS_CAN_SEE_PAYOUT_METHODS]: boolean;
+  [POLICIES.CONTRIBUTOR_INFO_THRESHOLDS]: {
+    legalName?: number;
+    address?: number;
+  };
+}>;
+
+export const DEFAULT_POLICIES: { [T in POLICIES]: Policies[T] } = {
+  [POLICIES.EXPENSE_POLICIES]: {
+    invoicePolicy: '',
+    receiptPolicy: '',
+    titlePolicy: '',
+    grantPolicy: '',
+  },
+  [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: {
+    enabled: false,
+    amountInCents: 0,
+    appliesToHostedCollectives: false,
+    appliesToSingleAdminCollectives: false,
+  },
+  [POLICIES.COLLECTIVE_MINIMUM_ADMINS]: {
+    numberOfAdmins: 0,
+    applies: 'NEW_COLLECTIVES',
+    freeze: false,
+  },
+  [POLICIES.MAXIMUM_VIRTUAL_CARD_LIMIT_AMOUNT_FOR_INTERVAL]: {
+    [VirtualCardLimitIntervals.ALL_TIME]:
+      config.virtualCards.maximumLimitForInterval[VirtualCardLimitIntervals.ALL_TIME],
+    [VirtualCardLimitIntervals.DAILY]: config.virtualCards.maximumLimitForInterval[VirtualCardLimitIntervals.DAILY],
+    [VirtualCardLimitIntervals.MONTHLY]: config.virtualCards.maximumLimitForInterval[VirtualCardLimitIntervals.MONTHLY],
+    [VirtualCardLimitIntervals.PER_AUTHORIZATION]:
+      config.virtualCards.maximumLimitForInterval[VirtualCardLimitIntervals.PER_AUTHORIZATION],
+    [VirtualCardLimitIntervals.WEEKLY]: config.virtualCards.maximumLimitForInterval[VirtualCardLimitIntervals.WEEKLY],
+    [VirtualCardLimitIntervals.YEARLY]: config.virtualCards.maximumLimitForInterval[VirtualCardLimitIntervals.YEARLY],
+  },
+  [POLICIES.REQUIRE_2FA_FOR_ADMINS]: false,
+  [POLICIES.COLLECTIVE_ADMINS_CAN_REFUND]: true,
+  [POLICIES.EXPENSE_CATEGORIZATION]: {
+    requiredForExpenseSubmitters: false,
+    requiredForCollectiveAdmins: false,
+  },
+  [POLICIES.EXPENSE_PUBLIC_VENDORS]: false,
+  [POLICIES.USE_VENDOR_POLICY]: UseVendorPolicyValue.HOST_ADMINS,
+  [POLICIES.COLLECTIVE_ADMINS_CAN_SEE_PAYOUT_METHODS]: false,
+  [POLICIES.CONTRIBUTOR_INFO_THRESHOLDS]: undefined,
+};
+
+export default POLICIES;
