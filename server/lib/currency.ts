@@ -143,8 +143,7 @@ export async function fetchFxRates(
 
   const isFutureDate = date !== 'latest' && moment(date).isAfter(moment(), 'day'); // Fixer API is not able to fetch future rates. Ideally, this function should return null when requesting a future date.
   const useFixerApi = Boolean(get(config, 'fixer.accessKey')) && !isFutureDate && !process.env.E2E_TEST;
-  const isLiveEnv = ['staging', 'production'].includes(config.env);
-  const useMockRate = !isLiveEnv && !parseToBoolean(get(config, 'fixer.disableMock'));
+  const useMockRate = !useFixerApi && !parseToBoolean(get(config, 'fixer.disableMock'));
 
   if (!useFixerApi) {
     showFixerWarning();
@@ -205,11 +204,8 @@ export async function getFxRate(
   } else if (!fromCurrency || !toCurrency) {
     return 1;
   } else if (!get(config, 'fixer.accessKey')) {
-    if (['staging', 'production'].includes(config.env)) {
-      throw new Error('Unable to fetch fxRate, Fixer API is not configured.');
-    } else {
-      return 1.1;
-    }
+    logger.warn('Fixer API is not configured. Falling back to mock rate 1.1');
+    return 1.1;
   }
 
   date = getDate(date);
